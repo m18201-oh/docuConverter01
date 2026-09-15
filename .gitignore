@@ -80,5 +80,10 @@ back/
 *.tar
 *.tar.gz
 *.rar
+*.exe
+
+# Local Claude Code config (machine-specific paths, hook binaries)
+.claude/
 
 !README.md
+.usage/
