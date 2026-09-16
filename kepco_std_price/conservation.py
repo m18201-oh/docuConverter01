@@ -74,6 +74,47 @@ def _wide_h(page: fitz.Page) -> list[tuple[float, float, float]]:
     return out
 
 
+def _vlines(page: fitz.Page) -> list[tuple[float, float, float]]:
+    """(x, y0, y1) 세로 벡터 선. 1행 표 ~19.8pt 도 포함한다."""
+    out: list[tuple[float, float, float]] = []
+    for d in page.get_drawings():
+        for item in d.get("items", []):
+            if item[0] != "l":
+                continue
+            p1, p2 = item[1], item[2]
+            if abs(p1.x - p2.x) >= 0.8:
+                continue
+            y0, y1 = sorted((float(p1.y), float(p2.y)))
+            if y1 - y0 > 15:
+                out.append((float((p1.x + p2.x) / 2), y0, y1))
+    return out
+
+
+def _vline_splits_word(
+    vlines: list[tuple[float, float, float]],
+    wx0: float,
+    wy0: float,
+    wx1: float,
+    wy1: float,
+) -> bool:
+    for vx, vy0, vy1 in vlines:
+        if not (wx0 + 0.35 < vx < wx1 - 0.35):
+            continue
+        if min(wy1, vy1) - max(wy0, vy0) > 1.0:
+            return True
+    return False
+
+
+def _bbox_overlap(a: object, b: object, tol: float = 0.5) -> bool:
+    if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)):
+        return False
+    if len(a) != 4 or len(b) != 4:
+        return False
+    ax0, ay0, ax1, ay1 = (float(v) for v in a)
+    bx0, by0, bx1, by1 = (float(v) for v in b)
+    return (min(ax1, bx1) - max(ax0, bx0) > -tol) and (min(ay1, by1) - max(ay0, by0) > -tol)
+
+
 def _header_field(text: str) -> str | None:
     return HEADER_NORM.get(text.strip().replace(" ", ""))
 
@@ -294,7 +335,7 @@ def _compact(s: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
-def _word_in_text(word: str, field: str) -> bool:
+def _word_in_text(word: str, field: str, *, allow_digit: bool = True) -> bool:
     if not field:
         return False
     if word in field.split():
@@ -307,10 +348,33 @@ def _word_in_text(word: str, field: str) -> bool:
             return any(_compact(t) == wn or t.replace(",", "") == wn for t in toks)
         return True
     # 붙은 숫자(1,361263 vs 1,361,263): 숫자만 비교
-    wd = re.sub(r"[^\d]", "", word)
-    if len(wd) >= 4:
-        fd = re.sub(r"[^\d]", "", field)
-        if wd in fd:
+    if allow_digit:
+        wd = re.sub(r"[^\d]", "", word)
+        if len(wd) >= 4:
+            fd = re.sub(r"[^\d]", "", field)
+            if wd in fd:
+                return True
+    return False
+
+
+def _wholly_in_one_field(word: str, rec: dict) -> bool:
+    """공백 무시 부분 문자열로 한 필드에 통째로 들어 있는가. 숫자만 비교는 쓰지 않는다.
+
+    천 단위 콤마만 다른 숫자(1,361263 vs 1,361,263)는 같은 필드로 본다.
+    """
+    wn = _compact(word)
+    if len(wn) < 2:
+        return True
+    wn_num = wn.replace(",", "")
+    word_is_num = bool(re.fullmatch(r"[\d,]+", wn))
+    for k in RAW_FIELDS:
+        v = rec.get(k)
+        if v is None:
+            continue
+        fn = _compact(str(v))
+        if wn in fn:
+            return True
+        if word_is_num and wn_num and wn_num in fn.replace(",", ""):
             return True
     return False
 
@@ -329,6 +393,8 @@ def _assign(
     word: tuple[float, float, float, float, str],
     records: list[dict],
     subheaders: list[dict],
+    *,
+    allow_digit: bool = True,
 ) -> list[str]:
     """낱말이 들어간 레코드 키(또는 소제목 패턴) 목록."""
     x0, y0, x1, y1, text = word
@@ -341,13 +407,13 @@ def _assign(
         bx0, by0, bx1, by1 = (float(v) for v in bbox)
         if not (by0 - 0.4 <= yc < by1 + 0.4 and bx0 - 1.0 <= xc <= bx1 + 1.0):
             continue
-        if _word_in_text(text, _record_blob(rec)):
+        if _word_in_text(text, _record_blob(rec), allow_digit=allow_digit):
             hits.append(rec.get("key") or rec.get("code") or "?")
     if hits:
         return hits
     for sub in subheaders:
         blob = f"{sub.get('code_pattern') or ''}\n{sub.get('text') or ''}"
-        if _word_in_text(text, blob):
+        if _word_in_text(text, blob, allow_digit=allow_digit):
             return [f"sub:{sub.get('code_pattern')}"]
     return []
 
@@ -387,12 +453,15 @@ def check_conservation(
         subs_by_page.setdefault(int(sub["pdf_page"]), []).append(sub)
 
     page_reports: list[dict[str, Any]] = []
-    tot_body = tot_assigned = tot_missing = tot_dup = 0
+    tot_body = tot_assigned = tot_missing = tot_dup = tot_split = 0
+    split_all: list[dict[str, Any]] = []
+    digit_only_all: list[dict[str, Any]] = []
 
     for pno in range(start, end + 1):
         page = doc[pno - 1]
         words = _words(page)
         bodies = _table_bodies(page)
+        vlines = _vlines(page)
         header_ys: list[float] = []
         for _ph, hx0, hx1 in _halves(page):
             header_ys.extend(_header_ys(words, hx0, hx1))
@@ -409,6 +478,7 @@ def check_conservation(
         subs = subs_by_page.get(pno, [])
         missing: list[dict[str, Any]] = []
         duplicate: list[dict[str, Any]] = []
+        split_words: list[dict[str, Any]] = []
         assigned = 0
         for w in body_words:
             hits = _assign(w, recs, subs)
@@ -432,6 +502,65 @@ def check_conservation(
                         "keys": uniq,
                     }
                 )
+            hits_strict = _assign(w, recs, subs, allow_digit=False)
+            if hits and not hits_strict:
+                digit_only_all.append(
+                    {
+                        "pdf_page": pno,
+                        "text": w[4],
+                        "x": round((w[0] + w[2]) / 2, 1),
+                        "y": round((w[1] + w[3]) / 2, 1),
+                        "keys": list(dict.fromkeys(hits)),
+                    }
+                )
+
+        for w in words:
+            wx0, wy0, wx1, wy1, text = w
+            wn = _compact(text)
+            if len(wn) < 2:
+                continue
+            xc, yc = (wx0 + wx1) / 2.0, (wy0 + wy1) / 2.0
+            hosts = []
+            for rec in recs:
+                bbox = rec.get("bbox") or [0, 0, 0, 0]
+                if len(bbox) != 4:
+                    continue
+                bx0, by0, bx1, by1 = (float(v) for v in bbox)
+                if by0 - 0.4 <= yc < by1 + 0.4 and bx0 - 1.0 <= xc <= bx1 + 1.0:
+                    hosts.append(rec)
+            if not hosts:
+                continue
+            if any(_wholly_in_one_field(text, rec) for rec in hosts):
+                continue
+            if _vline_splits_word(vlines, wx0, wy0, wx1, wy1):
+                continue
+            overlapped_ok = False
+            for rec in hosts:
+                rb = rec.get("bbox") or [0, 0, 0, 0]
+                for other in recs:
+                    if other is rec:
+                        continue
+                    if not _bbox_overlap(rb, other.get("bbox") or [0, 0, 0, 0]):
+                        continue
+                    if _wholly_in_one_field(text, other):
+                        overlapped_ok = True
+                        break
+                if overlapped_ok:
+                    break
+            if overlapped_ok:
+                continue
+            host = hosts[0]
+            item = {
+                "code": host.get("code"),
+                "pdf_page": pno,
+                "word": text,
+                "name": host.get("name"),
+                "spec": host.get("spec"),
+                "unit": host.get("unit"),
+            }
+            split_words.append(item)
+            split_all.append(item)
+
         page_reports.append(
             {
                 "pdf_page": pno,
@@ -439,24 +568,31 @@ def check_conservation(
                 "assigned": assigned,
                 "missing_count": len(missing),
                 "duplicate_count": len(duplicate),
+                "split_words_count": len(split_words),
                 "missing": missing,
                 "duplicate": duplicate,
+                "split_words": split_words,
             }
         )
         tot_body += len(body_words)
         tot_assigned += assigned
         tot_missing += len(missing)
         tot_dup += len(duplicate)
+        tot_split += len(split_words)
 
     doc.close()
     return {
         "half": result.get("half"),
         "pages": page_reports,
+        "split_words": split_all,
+        "digit_only": digit_only_all,
         "totals": {
             "body_words": tot_body,
             "assigned": tot_assigned,
             "missing": tot_missing,
             "duplicate": tot_dup,
-            "pass": tot_missing == 0 and tot_dup == 0,
+            "split_words": tot_split,
+            "digit_only": len(digit_only_all),
+            "pass": tot_missing == 0 and tot_dup == 0 and tot_split == 0,
         },
     }

@@ -116,7 +116,8 @@ def _page_lines(page: fitz.Page) -> tuple[list[LineSeg], list[LineSeg]]:
                     hs.append(LineSeg(float(x0), float(x1), float((p1.y + p2.y) / 2)))
             elif abs(p1.x - p2.x) < 0.8:
                 y0, y1 = sorted((p1.y, p2.y))
-                if y1 - y0 > 20:
+                # 1행짜리 작은 표는 헤더/데이터 세로선이 ~19.8pt 로 끊긴다.
+                if y1 - y0 > 15:
                     vs.append(LineSeg(float(y0), float(y1), float((p1.x + p2.x) / 2)))
     return hs, vs
 
@@ -222,6 +223,67 @@ def _text_in(spans: list[Span], x0: float, x1: float, y0: float, y1: float) -> s
                 lines.append([s])
         return "\n".join(t for t in (_join_chars_line(ln) for ln in lines) if t.strip() != "")
     return "\n".join(t for t in _cluster_lines(picked) if t.strip() != "")
+
+
+def _vline_crosses(wx0: float, wx1: float, real_vxs: list[float]) -> bool:
+    """실제 세로선이 낱말 x 범위 안쪽을 가로지르는가. 추정 경계는 여기 넣지 않는다."""
+    return any(wx0 + 0.35 < vx < wx1 - 0.35 for vx in real_vxs)
+
+
+def _cell_text(
+    words: list[tuple[float, float, float, float, str]],
+    chars: list[Span],
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+    real_vxs: list[float],
+) -> str:
+    """칸 텍스트. 추정 경계로는 낱말을 자르지 않고 x 중심 칸에 통째로 넣는다.
+
+    글자 단위 분할은 실제 세로선이 그 낱말을 가로지를 때만.
+    잘린 낱말 bbox 가 옆 낱말과 겹치면, 안 잘린 낱말 쪽 글자는 버린다.
+    """
+    row: list[tuple[float, float, float, float, str]] = []
+    for w in words:
+        yc = (w[1] + w[3]) / 2.0
+        if y0 < yc < y1:
+            row.append(w)
+    unsplit: list[tuple[float, float, float, float, str]] = []
+    split: list[tuple[float, float, float, float, str]] = []
+    for w in row:
+        if _vline_crosses(w[0], w[2], real_vxs):
+            split.append(w)
+        else:
+            unsplit.append(w)
+    pieces: list[Span] = []
+    for wx0, wy0, wx1, wy1, t in unsplit:
+        xc = (wx0 + wx1) / 2.0
+        if x0 - 0.2 <= xc < x1:
+            pieces.append(Span(wx0, wy0, wx1, wy1, t))
+    for wx0, wy0, wx1, wy1, t in split:
+        if wx1 <= x0 or wx0 >= x1:
+            continue
+        for c in chars:
+            if c.xc < wx0 - 0.4 or c.xc > wx1 + 0.4:
+                continue
+            if c.yc < wy0 - 0.4 or c.yc > wy1 + 0.4:
+                continue
+            if not (x0 - 0.2 <= c.xc < x1 and y0 < c.yc < y1):
+                continue
+            stolen = False
+            for ux0, uy0, ux1, uy1, _ut in unsplit:
+                if ux0 - 0.2 <= c.xc <= ux1 + 0.2 and uy0 - 0.2 <= c.yc <= uy1 + 0.2:
+                    stolen = True
+                    break
+            if stolen:
+                continue
+            pieces.append(c)
+    if not pieces:
+        return ""
+    lo = min(p.x0 for p in pieces) - 1.0
+    hi = max(p.x1 for p in pieces) + 1.0
+    return _text_in(pieces, lo, hi, y0, y1)
 
 
 def _collapse(s: str) -> str:
@@ -1038,6 +1100,7 @@ def extract_pdf(
                         continue
 
                     vxs = _vxs_near(vlines, y_min - 50, y_max + 20, table_x0, table_x1)
+                    real_vxs = list(vxs)
                     colmap = _build_columns(vxs, table_x0, table_x1, lab)
                     if "code" not in colmap and last_colmap and "code" in last_colmap:
                         old0 = min(a for a, _ in last_colmap.values())
@@ -1100,7 +1163,7 @@ def extract_pdf(
                         if kind == "star":
                             pat = sp.text.strip()
                             # 소제목 텍스트: 코드 열 오른쪽 전체
-                            txt = _collapse(_text_in(chars, name_col[0], tx, y0, y1))
+                            txt = _collapse(_cell_text(words_all, chars, name_col[0], tx, y0, y1, real_vxs))
                             current_sub = (pat, txt)
                             subheaders.append(
                                 {
@@ -1114,19 +1177,19 @@ def extract_pdf(
                             continue
 
                         code = sp.text.strip()
-                        name_raw = _text_in(chars, name_col[0], name_col[1], y0, y1)
-                        spec_raw = _text_in(chars, spec_col[0], spec_col[1], y0, y1)
-                        unit_raw = _text_in(chars, unit_col[0], unit_col[1], y0, y1)
-                        price_raw0 = _text_in(chars, price_col[0], price_col[1], y0, y1)
-                        labor_raw0 = _text_in(chars, labor_col[0], labor_col[1], y0, y1)
+                        name_raw = _cell_text(words_all, chars, name_col[0], name_col[1], y0, y1, real_vxs)
+                        spec_raw = _cell_text(words_all, chars, spec_col[0], spec_col[1], y0, y1, real_vxs)
+                        unit_raw = _cell_text(words_all, chars, unit_col[0], unit_col[1], y0, y1, real_vxs)
+                        price_raw0 = _cell_text(words_all, chars, price_col[0], price_col[1], y0, y1, real_vxs)
+                        labor_raw0 = _cell_text(words_all, chars, labor_col[0], labor_col[1], y0, y1, real_vxs)
                         remark_raw = (
-                            _text_in(chars, remark_col[0], remark_col[1], y0, y1)
+                            _cell_text(words_all, chars, remark_col[0], remark_col[1], y0, y1, real_vxs)
                             if has_remark
                             else ""
                         )
 
                         # 코드 열이 명칭 첫 글자를 삼킨 경우(맹암거, PHC, L형…) 되돌림
-                        gap_txt = _text_in(chars, code_col[0], name_col[0], y0, y1)
+                        gap_txt = _cell_text(words_all, chars, code_col[0], name_col[0], y0, y1, real_vxs)
                         gap_txt = CODE_FIND.sub("", gap_txt)
                         gap_txt = STAR_FIND.sub("", gap_txt)
                         gap_txt = re.sub(r"\s+", "", gap_txt)
