@@ -44,10 +44,7 @@ coverage.xml
 .pytest_cache/
 
 # Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
+.ipynb_checkpoints/
 
 # IDE
 .vscode/
