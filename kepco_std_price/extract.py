@@ -230,6 +230,53 @@ def _vline_crosses(wx0: float, wx1: float, real_vxs: list[float]) -> bool:
     return any(wx0 + 0.35 < vx < wx1 - 0.35 for vx in real_vxs)
 
 
+def _join_cell_text(word_spans: list[Span], char_spans: list[Span]) -> str:
+    """같은 줄의 원문 낱말 사이에는 공백 한 칸. 잘린 낱말의 글자는 붙인다."""
+    tagged: list[tuple[Span, str]] = [(s, "word") for s in word_spans] + [
+        (s, "char") for s in char_spans
+    ]
+    if not tagged:
+        return ""
+    tagged.sort(key=lambda t: (t[0].y0, t[0].x0))
+    lines: list[list[tuple[Span, str]]] = []
+    for item in tagged:
+        s = item[0]
+        if not lines:
+            lines.append([item])
+            continue
+        prev_yc = sum(x[0].yc for x in lines[-1]) / len(lines[-1])
+        if abs(s.yc - prev_yc) <= max(4.0, (s.y1 - s.y0) * 0.45):
+            lines[-1].append(item)
+        else:
+            lines.append([item])
+    out: list[str] = []
+    for ln in lines:
+        ln.sort(key=lambda t: t[0].x0)
+        tokens: list[str] = []
+        buf: list[Span] = []
+
+        def flush() -> None:
+            if not buf:
+                return
+            t = _join_chars_line(buf)
+            if t:
+                tokens.append(t)
+            buf.clear()
+
+        for s, kind in ln:
+            if kind == "word":
+                flush()
+                if s.text:
+                    tokens.append(s.text)
+            else:
+                buf.append(s)
+        flush()
+        line = " ".join(t for t in tokens if t != "")
+        if line.strip():
+            out.append(line)
+    return "\n".join(out)
+
+
 def _cell_text(
     words: list[tuple[float, float, float, float, str]],
     chars: list[Span],
@@ -243,6 +290,7 @@ def _cell_text(
 
     글자 단위 분할은 실제 세로선이 그 낱말을 가로지를 때만.
     잘린 낱말 bbox 가 옆 낱말과 겹치면, 안 잘린 낱말 쪽 글자는 버린다.
+    같은 줄의 이웃 원문 낱말은 공백 한 칸으로 잇는다.
     """
     row: list[tuple[float, float, float, float, str]] = []
     for w in words:
@@ -256,11 +304,12 @@ def _cell_text(
             split.append(w)
         else:
             unsplit.append(w)
-    pieces: list[Span] = []
+    word_spans: list[Span] = []
     for wx0, wy0, wx1, wy1, t in unsplit:
         xc = (wx0 + wx1) / 2.0
         if x0 - 0.2 <= xc < x1:
-            pieces.append(Span(wx0, wy0, wx1, wy1, t))
+            word_spans.append(Span(wx0, wy0, wx1, wy1, t))
+    char_spans: list[Span] = []
     for wx0, wy0, wx1, wy1, t in split:
         if wx1 <= x0 or wx0 >= x1:
             continue
@@ -278,12 +327,10 @@ def _cell_text(
                     break
             if stolen:
                 continue
-            pieces.append(c)
-    if not pieces:
+            char_spans.append(c)
+    if not word_spans and not char_spans:
         return ""
-    lo = min(p.x0 for p in pieces) - 1.0
-    hi = max(p.x1 for p in pieces) + 1.0
-    return _text_in(pieces, lo, hi, y0, y1)
+    return _join_cell_text(word_spans, char_spans)
 
 
 def _collapse(s: str) -> str:
@@ -670,12 +717,55 @@ def _col(colmap: dict[str, tuple[float, float]], name: str, fallback: tuple[floa
     return colmap.get(name, fallback)
 
 
+def _is_figure_caption_line(text: str) -> bool:
+    return text.lstrip().startswith("[그림")
+
+
+def _figure_captions_from_words(
+    words: list[tuple[float, float, float, float, str]],
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+) -> list[str]:
+    """줄 첫 낱말이 [그림 으로 시작하는 줄을 공백으로 이어 제목으로 만든다."""
+    picked = [
+        w
+        for w in words
+        if x0 - 1 <= (w[0] + w[2]) / 2 < x1 + 1 and y0 < (w[1] + w[3]) / 2 < y1
+    ]
+    if not picked:
+        return []
+    picked = sorted(picked, key=lambda w: ((w[1] + w[3]) / 2.0, w[0]))
+    lines: list[list[tuple[float, float, float, float, str]]] = []
+    for w in picked:
+        yc = (w[1] + w[3]) / 2.0
+        if not lines:
+            lines.append([w])
+            continue
+        prev_yc = sum((x[1] + x[3]) / 2.0 for x in lines[-1]) / len(lines[-1])
+        if abs(yc - prev_yc) <= max(4.0, (w[3] - w[1]) * 0.45):
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    caps: list[str] = []
+    for ln in lines:
+        ln = sorted(ln, key=lambda w: w[0])
+        if ln and ln[0][4].startswith("[그림"):
+            cap = " ".join(w[4] for w in ln if w[4]).strip()
+            if cap:
+                caps.append(cap)
+    return caps
+
+
 def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
     items: list[dict] = []
     buf = ""
     for line in lines:
         s = line.strip()
         if not s or s.startswith("【단가정의】") or s.startswith("단가정의"):
+            continue
+        if _is_figure_caption_line(s):
             continue
         if _is_note_junk(s):
             continue
@@ -956,6 +1046,7 @@ def extract_pdf(
                     "major_name": last_major_name,
                     "field": page_field,
                     "notes": [],
+                    "figures": [],
                     "record_count": 0,
                 }
                 groups.append(g)
@@ -1037,7 +1128,20 @@ def extract_pdf(
                         if re.search(r"매끈한마감|보통마감|거친마감", s):
                             continue
                     lines_txt.append(s)
-                grp["notes"].extend(_note_items(lines_txt, pno))
+                word_caps = _figure_captions_from_words(words_all, hx0, hx1, y0, y1)
+                kept_lines: list[str] = []
+                span_caps: list[str] = []
+                for s in lines_txt:
+                    if _is_figure_caption_line(s):
+                        span_caps.append(_collapse(s))
+                    else:
+                        kept_lines.append(s)
+                caps = word_caps or span_caps
+                if caps:
+                    grp.setdefault("figures", [])
+                    for cap in caps:
+                        grp["figures"].append({"caption": cap, "pdf_page": pno})
+                grp["notes"].extend(_note_items(kept_lines, pno))
 
             # 쪽 넘김으로 그룹을 끝내지 않음: 첫머리 주석(⑤부터, 【단가정의】 없이 ①)을 이전 그룹에
             first_group_y = min((e[0] for e in events if e[1] == "group"), default=None)

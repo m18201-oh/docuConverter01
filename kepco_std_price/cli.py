@@ -70,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
             f"conservation: body={tot.get('body_words')} assigned={tot.get('assigned')} "
             f"missing={tot.get('missing')} duplicate={tot.get('duplicate')} "
             f"split_words={tot.get('split_words')} "
+            f"lost_spaces={tot.get('lost_spaces')} "
+            f"inserted_spaces={tot.get('inserted_spaces')} "
             f"pass={tot.get('pass')}",
             flush=True,
         )

@@ -99,11 +99,19 @@ def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> None:
                     + " |"
                 )
             notes = g.get("notes") or []
+            figures = g.get("figures") or []
             if notes:
                 lines.append("")
                 lines.append("**【단가정의】**")
                 for n in notes:
                     lines.append(n.get("item") or "")
+            if figures:
+                if not notes:
+                    lines.append("")
+                for fig in figures:
+                    cap = fig.get("caption") or ""
+                    if cap:
+                        lines.append(f"그림: {cap}")
             lines.append("")
 
         (dest_dir / fname).write_text("\n".join(lines), encoding="utf-8")

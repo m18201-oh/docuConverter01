@@ -434,6 +434,82 @@ def _skip_word(
     return False
 
 
+def _vline_between(
+    vlines: list[tuple[float, float, float]],
+    x_left: float,
+    x_right: float,
+    y0: float,
+    y1: float,
+) -> bool:
+    if x_right - x_left <= 0.7:
+        return False
+    for vx, vy0, vy1 in vlines:
+        if not (x_left + 0.35 < vx < x_right - 0.35):
+            continue
+        if min(y1, vy1) - max(y0, vy0) > 1.0:
+            return True
+    return False
+
+
+def _cluster_word_lines(
+    words: list[tuple[float, float, float, float, str]],
+    gap: float = 4.0,
+) -> list[list[tuple[float, float, float, float, str]]]:
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: ((w[1] + w[3]) / 2.0, w[0]))
+    lines: list[list[tuple[float, float, float, float, str]]] = []
+    for w in words:
+        yc = (w[1] + w[3]) / 2.0
+        if not lines:
+            lines.append([w])
+            continue
+        prev_yc = sum((x[1] + x[3]) / 2.0 for x in lines[-1]) / len(lines[-1])
+        if abs(yc - prev_yc) <= max(gap, (w[3] - w[1]) * 0.45):
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    return lines
+
+
+def _raw_field_values(rec: dict) -> list[str]:
+    out: list[str] = []
+    for k in RAW_FIELDS:
+        v = rec.get(k)
+        if v is None:
+            continue
+        s = str(v)
+        if s:
+            out.append(s)
+    return out
+
+
+def _inserted_space(word: str, field: str) -> bool:
+    """원문 낱말이 raw 필드 안에서 공백으로 쪼개져 있는가."""
+    if not word or not field:
+        return False
+    if word in field:
+        return False
+    wn = _compact(word)
+    if len(wn) < 2:
+        return False
+    fn = _compact(field)
+    idx = fn.find(wn)
+    if idx < 0:
+        return False
+    compact_i = 0
+    start: int | None = None
+    for pos, ch in enumerate(field):
+        if ch.isspace():
+            continue
+        if compact_i == idx and start is None:
+            start = pos
+        if start is not None and compact_i == idx + len(wn) - 1:
+            return any(c.isspace() for c in field[start : pos + 1])
+        compact_i += 1
+    return False
+
+
 def check_conservation(
     pdf_path: str | Path,
     result: dict[str, Any],
@@ -454,7 +530,10 @@ def check_conservation(
 
     page_reports: list[dict[str, Any]] = []
     tot_body = tot_assigned = tot_missing = tot_dup = tot_split = 0
+    tot_lost = tot_ins = 0
     split_all: list[dict[str, Any]] = []
+    lost_all: list[dict[str, Any]] = []
+    inserted_all: list[dict[str, Any]] = []
     digit_only_all: list[dict[str, Any]] = []
 
     for pno in range(start, end + 1):
@@ -561,6 +640,64 @@ def check_conservation(
             split_words.append(item)
             split_all.append(item)
 
+        lost_spaces: list[dict[str, Any]] = []
+        inserted_spaces: list[dict[str, Any]] = []
+        for rec in recs:
+            bbox = rec.get("bbox") or [0, 0, 0, 0]
+            if len(bbox) != 4:
+                continue
+            bx0, by0, bx1, by1 = (float(v) for v in bbox)
+            fields = _raw_field_values(rec)
+            rec_words: list[tuple[float, float, float, float, str]] = []
+            for w in words:
+                wx0, wy0, wx1, wy1, text = w
+                xc, yc = (wx0 + wx1) / 2.0, (wy0 + wy1) / 2.0
+                if not (by0 - 0.4 <= yc < by1 + 0.4 and bx0 - 1.0 <= xc <= bx1 + 1.0):
+                    continue
+                if not any(_word_in_text(text, f, allow_digit=False) for f in fields):
+                    continue
+                rec_words.append(w)
+                if len(_compact(text)) < 2:
+                    continue
+                for field in fields:
+                    if _inserted_space(text, field):
+                        item_ins = {
+                            "code": rec.get("code"),
+                            "pdf_page": pno,
+                            "word1": text,
+                            "word2": "",
+                            "field": field,
+                        }
+                        inserted_spaces.append(item_ins)
+                        inserted_all.append(item_ins)
+                        break
+            for line in _cluster_word_lines(rec_words):
+                line = sorted(line, key=lambda w: w[0])
+                for i in range(len(line) - 1):
+                    a, b = line[i], line[i + 1]
+                    if _vline_between(
+                        vlines,
+                        a[2],
+                        b[0],
+                        min(a[1], b[1]),
+                        max(a[3], b[3]),
+                    ):
+                        continue
+                    t1, t2 = a[4], b[4]
+                    glued = t1 + t2
+                    for field in fields:
+                        if glued in field:
+                            item_lost = {
+                                "code": rec.get("code"),
+                                "pdf_page": pno,
+                                "word1": t1,
+                                "word2": t2,
+                                "field": field,
+                            }
+                            lost_spaces.append(item_lost)
+                            lost_all.append(item_lost)
+                            break
+
         page_reports.append(
             {
                 "pdf_page": pno,
@@ -569,9 +706,13 @@ def check_conservation(
                 "missing_count": len(missing),
                 "duplicate_count": len(duplicate),
                 "split_words_count": len(split_words),
+                "lost_spaces_count": len(lost_spaces),
+                "inserted_spaces_count": len(inserted_spaces),
                 "missing": missing,
                 "duplicate": duplicate,
                 "split_words": split_words,
+                "lost_spaces": lost_spaces,
+                "inserted_spaces": inserted_spaces,
             }
         )
         tot_body += len(body_words)
@@ -579,12 +720,16 @@ def check_conservation(
         tot_missing += len(missing)
         tot_dup += len(duplicate)
         tot_split += len(split_words)
+        tot_lost += len(lost_spaces)
+        tot_ins += len(inserted_spaces)
 
     doc.close()
     return {
         "half": result.get("half"),
         "pages": page_reports,
         "split_words": split_all,
+        "lost_spaces": lost_all,
+        "inserted_spaces": inserted_all,
         "digit_only": digit_only_all,
         "totals": {
             "body_words": tot_body,
@@ -592,7 +737,13 @@ def check_conservation(
             "missing": tot_missing,
             "duplicate": tot_dup,
             "split_words": tot_split,
+            "lost_spaces": tot_lost,
+            "inserted_spaces": tot_ins,
             "digit_only": len(digit_only_all),
-            "pass": tot_missing == 0 and tot_dup == 0 and tot_split == 0,
+            "pass": tot_missing == 0
+            and tot_dup == 0
+            and tot_split == 0
+            and tot_lost == 0
+            and tot_ins == 0,
         },
     }
