@@ -51,6 +51,14 @@ def main(argv: list[str] | None = None) -> int:
     _write_jsonl(out / "subheaders.jsonl", result["subheaders"])
     _write_jsonl(out / "pages.jsonl", result["pages"])
     render_md(result, out / "md", pdf_name=Path(args.pdf).name)
+    recs = result["records"]
+    n_null = sum(1 for r in recs if not r.get("group_id"))
+    n_pres = sum(1 for r in recs if r.get("status") == "present")
+    n_ab = sum(1 for r in recs if r.get("status") == "abolished")
+    print(
+        f"records={len(recs)} present={n_pres} abolished={n_ab} group_id_null={n_null}",
+        flush=True,
+    )
     if args.check_conservation:
         report = check_conservation(args.pdf, result, pages=pages)
         (out / "conservation.json").write_text(

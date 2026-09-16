@@ -84,7 +84,7 @@ def _is_price_tok(t: str) -> bool:
         return True
     if LABOR_RE.match(s):
         return True
-    if PRICE_RE.match(s) and ("," in s or len(s) >= 3):
+    if PRICE_RE.match(s) and ("," in s or len(s) >= 4):
         return True
     return False
 
@@ -122,7 +122,7 @@ def _header_ys(
     out = []
     for row in rows:
         fields = {f for _, f, _ in row}
-        if len(fields) >= 3:
+        if len(fields) >= 3 and "price" in fields:
             out.append(sum(r[0] for r in row) / len(row))
     return out
 
@@ -131,25 +131,29 @@ def _rec_codes(
     words: list[tuple[float, float, float, float, str]],
     x0: float,
     x1: float,
+    table_x0: float | None = None,
+    table_x1: float | None = None,
 ) -> list[tuple[str, float, float, float]]:
-    """(code, yc, y0, y1) 본문 코드만(오른쪽에 단가/폐지/노무비율)."""
-    half_w = x1 - x0
+    """(code, yc, y0, y1) 본문 코드만(오른쪽에 단가/폐지/노무비율). 표 실제 x 사용."""
+    tx0 = x0 if table_x0 is None else table_x0
+    tx1 = x1 if table_x1 is None else table_x1
+    half_w = tx1 - tx0
     codes = []
     for wx0, wy0, wx1, wy1, t in words:
-        if not (x0 - 2 <= wx0 < x1):
+        if not (tx0 - 2 <= wx0 < tx1):
             continue
         m = CODE_RE.search(t)
         if not m or m.start() > 2:
             continue
-        if wx0 > x0 + half_w * 0.28:
+        if wx0 > tx0 + half_w * 0.28:
             continue
         yc = (wy0 + wy1) / 2
-        thresh = x0 + half_w * 0.60
+        thresh = tx0 + half_w * 0.60
         priced = False
         for sx0, sy0, sx1, sy1, st in words:
             sxc = (sx0 + sx1) / 2
             syc = (sy0 + sy1) / 2
-            if sxc < thresh or sxc > x1 + 2:
+            if sxc < thresh or sxc > tx1 + 2:
                 continue
             if abs(syc - yc) > 10:
                 continue
@@ -220,7 +224,12 @@ def _table_bodies(page: fitz.Page) -> list[tuple[float, float, float, float]]:
     for _ph, hx0, hx1 in _halves(page):
         ww = [w for w in words if hx0 - 1 <= (w[0] + w[2]) / 2 < hx1 + 1]
         headers = _header_ys(ww, hx0, hx1)
-        codes = _rec_codes(ww, hx0, hx1)
+        tx0, tx1 = _table_x(hlines, 0, page.rect.height, hx0, hx1, layout_minw)
+        # 격자 가로선이 반 폭 폴백이면(색인) 표로 보지 않음
+        has_grid = abs(tx0 - (hx0 + 8)) > 2 or abs(tx1 - (hx1 - 8)) > 2
+        if not headers and not has_grid:
+            continue
+        codes = _rec_codes(ww, hx0, hx1, table_x0=tx0, table_x1=tx1)
         gys = _group_ys(ww, hx0, hx1)
         dys = _danga_ys(ww, hx0, hx1)
         if not codes:
@@ -292,12 +301,18 @@ def _word_in_text(word: str, field: str) -> bool:
         return True
     wn = _compact(word)
     fn = _compact(field)
-    if not wn or wn not in fn:
-        return False
-    if wn.isdigit() and len(wn) <= 2:
-        toks = re.findall(r"[0-9]+(?:,[0-9]{3})*|[^\s]+", field)
-        return any(_compact(t) == wn or t.replace(",", "") == wn for t in toks)
-    return True
+    if wn and wn in fn:
+        if wn.isdigit() and len(wn) <= 2:
+            toks = re.findall(r"[0-9]+(?:,[0-9]{3})*|[^\s]+", field)
+            return any(_compact(t) == wn or t.replace(",", "") == wn for t in toks)
+        return True
+    # 붙은 숫자(1,361263 vs 1,361,263): 숫자만 비교
+    wd = re.sub(r"[^\d]", "", word)
+    if len(wd) >= 4:
+        fd = re.sub(r"[^\d]", "", field)
+        if wd in fd:
+            return True
+    return False
 
 
 def _record_blob(rec: dict) -> str:

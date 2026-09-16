@@ -303,7 +303,8 @@ def _header_labels(spans: list[Span], x0: float, x1: float) -> list[tuple[float,
             pieces = [s for s in band if s.text.strip() in ("공", "종", "명")]
             if len(pieces) >= 3:
                 labels["name"] = sum(s.xc for s in pieces) / len(pieces)
-        if len(set(labels)) >= 3:
+        # 단가 열이 없는 헤더(색인·목록)는 레코드 표가 아니다
+        if len(set(labels)) >= 3 and "price" in labels:
             y1 = max(s.y1 for s in row)
             out.append((yc, labels, y1, min(s.y0 for s in row)))
     return out  # type: ignore[return-value]
@@ -391,7 +392,22 @@ def _codes_and_stars(spans: list[Span], x0: float, x1: float) -> tuple[list[Span
     return codes, stars
 
 
+def _is_real_price_tok(t: str) -> bool:
+    """본문 단가/폐지/노무비율. 규격 조각(150, 13, CTC 600)은 제외."""
+    s = t.strip().replace(" ", "")
+    if not s:
+        return False
+    if "폐지" in s:
+        return True
+    if LABOR_RE.match(s):
+        return True
+    if PRICE_RE.match(s) and ("," in s or len(s) >= 4):
+        return True
+    return False
+
+
 def _has_price_on_line(code: Span, spans: list[Span], x0: float, x1: float) -> bool:
+    """같은 줄 오른쪽(표 x 의 60% 이후)에 진짜 단가/폐지/노무비율이 있는가."""
     thresh = x0 + (x1 - x0) * 0.60
     for s in spans:
         if s.xc < thresh:
@@ -400,14 +416,84 @@ def _has_price_on_line(code: Span, spans: list[Span], x0: float, x1: float) -> b
             continue
         if abs(s.yc - code.yc) > 10:
             continue
-        t = s.text.strip().replace(" ", "")
-        if "폐지" in t:
-            return True
-        if LABOR_RE.match(t):
-            return True
-        if PRICE_RE.match(t) and ("," in t or len(t) >= 3):
+        if _is_real_price_tok(s.text):
             return True
     return False
+
+
+def _half_table_x(
+    hlines: list[LineSeg],
+    hx0: float,
+    hx1: float,
+    min_w: float,
+) -> tuple[float, float] | None:
+    """이 단에서 표 격자 가로선으로 실제 표 x 범위를 잡는다. 없으면 None."""
+    need = max(40.0, min_w * 0.5)
+    cand: list[LineSeg] = []
+    for h in hlines:
+        ov = min(h.b, hx1) - max(h.a, hx0)
+        if ov >= need:
+            cand.append(h)
+    if not cand:
+        return None
+    return max(min(h.a for h in cand), hx0 + 2), min(max(h.b for h in cand), hx1 - 2)
+
+
+def _is_danga_label(text: str) -> bool:
+    """【단가정의】 라벨만. 본문 '단가정의를 참고…' 는 제외."""
+    t = text.replace(" ", "").strip()
+    if "【단가정의】" in t:
+        return True
+    if t == "단가정의":
+        return True
+    return False
+
+
+def _near_table_h(
+    sp: Span,
+    hlines: list[LineSeg],
+    hx0: float,
+    hx1: float,
+    min_w: float,
+    ytol: float = 50.0,
+) -> bool:
+    """표 격자(가로선) 근처인가. 칸 단위 짧은 선도 인정. 주석 속 별표는 선이 없다."""
+    need = 40.0
+    for h in hlines:
+        if abs(h.c - sp.yc) > ytol:
+            continue
+        if min(h.b, hx1) - max(h.a, hx0) >= need:
+            return True
+    return False
+
+
+def _price_word_complete(
+    price_tok: str,
+    words: list[tuple[float, float, float, float, str]],
+    price_col: tuple[float, float],
+    y0: float,
+    y1: float,
+) -> bool:
+    """짧은 숫자 조각(13, 150, 600)이 규격 낱말에서 온 경우만 거절. 진짜 단가는 통과."""
+    if not price_tok or price_tok == "폐지":
+        return True
+    compact = price_tok.replace(" ", "").replace(",", "")
+    if "," in price_tok or len(compact) >= 4:
+        return True
+    px0, px1 = price_col
+    for wx0, wy0, wx1, wy1, t in words:
+        yc = (wy0 + wy1) / 2
+        if not (y0 - 0.5 < yc < y1 + 0.5):
+            continue
+        wt = t.strip()
+        if not wt:
+            continue
+        if price_tok not in wt and wt not in price_tok and compact not in wt.replace(",", "").replace(" ", ""):
+            continue
+        if wx0 >= px0 - 2.5 and wx1 <= px1 + 2.5:
+            return True
+        return False
+    return True
 
 
 def _vxs_near(vlines: list[LineSeg], y0: float, y1: float, x0: float, x1: float) -> list[float]:
@@ -529,6 +615,8 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
         s = line.strip()
         if not s or s.startswith("【단가정의】") or s.startswith("단가정의"):
             continue
+        if _is_note_junk(s):
+            continue
         if s.startswith("(표)"):
             if buf:
                 items.append({"item": buf.strip(), "pdf_page": pdf_page})
@@ -537,7 +625,7 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
             continue
         if s and s[0] in CIRCLED:
             if buf:
-                items.append({"item": buf.strip(), "pdf_page": pdf_page})
+                items.append({"item": _trim_note(buf), "pdf_page": pdf_page})
             rest = s[1:].lstrip()
             buf = f"{s[0]} {rest}" if rest else s[0]
         else:
@@ -545,9 +633,43 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
                 buf = buf + " " + s
             else:
                 buf = s
-    if buf:
-        items.append({"item": buf.strip(), "pdf_page": pdf_page})
+    if buf and not _is_note_junk(buf):
+        items.append({"item": _trim_note(buf), "pdf_page": pdf_page})
     return items
+
+
+def _trim_note(s: str) -> str:
+    t = re.sub(r"\s*-\s*\d+\s*-\s*$", "", s.strip())
+    return t.strip()
+
+
+def _is_note_junk(s: str) -> bool:
+    t = s.strip()
+    if not t:
+        return True
+    if t[0] in CIRCLED or t.startswith("(표)") or t.startswith("<"):
+        return False
+    compact = t.replace(" ", "")
+    compact = re.sub(r"-\d+-", "", compact)
+    compact = compact.replace("()", "").strip("-").strip()
+    if not compact:
+        return True
+    if re.fullmatch(r"-\d+-", t.replace(" ", "")):
+        return True
+    if t.startswith("대분류") or compact.startswith("대분류"):
+        return True
+    if re.match(r"^[A-Z]{2}\d+\*", compact) and len(compact) < 28:
+        return True
+    if STAR_FIND.fullmatch(compact) or re.fullmatch(r"[A-Z]{2}\d+\*+", compact):
+        return True
+    # 표 잔여 조각
+    if t.endswith("/") and len(t) < 40:
+        return True
+    if len(compact) < 24 and not re.search(r"[가-힣]{3,}", t):
+        return True
+    if t.startswith("- ") and re.search(r"(총연장|초과|이하)", t) and "단가" not in t:
+        return True
+    return False
 
 
 def _flatten_subtable(table) -> str:
@@ -662,6 +784,11 @@ def extract_pdf(
         page_field = _field_at(field_starts, pno)
         spans_all = _page_spans(page)
         chars_all = _page_chars(page)
+        words_all = [
+            (float(w[0]), float(w[1]), float(w[2]), float(w[3]), w[4])
+            for w in page.get_text("words")
+            if w[4]
+        ]
         hlines, vlines = _page_lines(page)
         try:
             tabs = page.find_tables()
@@ -687,9 +814,26 @@ def extract_pdf(
                     last_major_name = name
 
             codes_all, stars_all = _codes_and_stars(spans, hx0, hx1)
-            rec_codes = [c for c in codes_all if _has_price_on_line(c, spans, hx0, hx1)]
-            # 소제목은 코드 열 왼쪽(표 왼쪽 1/3)만
-            stars = [s for s in stars_all if s.xc < hx0 + (hx1 - hx0) * 0.35]
+            # 단가 판정은 반 폭이 아니라 이 표의 실제 x
+            tx = _half_table_x(hlines, hx0, hx1, min_w)
+            if tx is None and last_colmap:
+                tx = (
+                    min(a for a, _ in last_colmap.values()),
+                    max(b for _, b in last_colmap.values()),
+                )
+            px0, px1 = tx if tx is not None else (hx0, hx1)
+            rec_codes = [c for c in codes_all if _has_price_on_line(c, spans, px0, px1)]
+            # 소제목은 코드 열 왼쪽 + 표 격자 근처만(주석 속 ND109.12*** 제외)
+            stars = []
+            for s in stars_all:
+                if s.xc >= hx0 + (hx1 - hx0) * 0.35:
+                    continue
+                if not _near_table_h(s, hlines, hx0, hx1, min_w):
+                    continue
+                ln = _line_text_at(spans, s.yc, hx0, hx1, tol=8)
+                if ln and ln.lstrip()[:1] in CIRCLED:
+                    continue
+                stars.append(s)
 
             # cluster codes+stars into tables
             markers: list[tuple[str, Span]] = [("code", c) for c in rec_codes] + [("star", s) for s in stars]
@@ -713,8 +857,8 @@ def extract_pdf(
             if cur:
                 clusters.append(cur)
 
-            # y-ordered events: group headers + clusters + 단가정의
-            dangas = [s for s in spans if "단가정의" in s.text.replace(" ", "")]
+            # y-ordered events: group headers + clusters + 단가정의 라벨만
+            dangas = [s for s in spans if _is_danga_label(s.text)]
             events: list[tuple[float, str, object]] = []
             for g in gheads:
                 events.append((g.yc, "group", g))
@@ -778,15 +922,34 @@ def extract_pdf(
                     head = " ".join(str(c or "") for c in ext0)
                     if "공종코드" in head or "공종명칭" in head or "공종명" in head:
                         continue
+                    full_txt = ""
+                    try:
+                        full_txt = " ".join(str(c or "") for row in (t.extract() or []) for c in row)
+                    except Exception:
+                        full_txt = head
+                    full_c = full_txt.replace(" ", "")
+                    if "대분류" in full_c:
+                        # 두 글자 대분류(Q, R) 배너는 정답지가 (표) 로 둔다. 한 글자 배너는 제외.
+                        if not re.search(r"대분류\s*[A-Z]\s*[,，]\s*[A-Z]", full_txt):
+                            continue
                     ncodes = 0
                     for s in rec_codes:
                         if tb[0] - 5 <= s.xc <= tb[2] + 5 and tb[1] <= s.yc <= tb[3]:
                             ncodes += 1
                     if ncodes >= 1 and t.col_count >= 5:
                         continue
+                    # 배너처럼 열이 지나치게 많은 표는, 두 글자 대분류가 아니면 제외
+                    if t.col_count >= 12 and "대분류" not in full_c:
+                        continue
+                    # 사례1 암질 5열 표는 ⑦ 본문에 이미 있고, 사례2(양호 4열)만 (표)
+                    row0 = [re.sub(r"\s+", "", str(c or "")) for c in ext0]
+                    labels = {"양호", "보통", "불량"}
+                    if t.col_count >= 5 and row0 and all(x in labels or x == "" for x in row0) and "보통" in row0:
+                        continue
                     flat = _flatten_subtable(t)
                     if flat:
                         lines_txt.append(flat)
+                have_sub = any(x.startswith("(표)") for x in lines_txt)
                 # text lines
                 for ln in raw_lines:
                     s = ln.strip()
@@ -800,11 +963,34 @@ def extract_pdf(
                         continue
                     if any(s.startswith(h) for h in ("공종코드", "공종명칭", "공종명", "규격", "단위", "단가", "노무비율", "비고", "비 고")):
                         continue
+                    if _is_note_junk(s):
+                        continue
+                    # (표) 글줄 중복: 이미 flatten 한 표에 들어 있는 글만 건너뜀
+                    if have_sub and s[0] not in CIRCLED and not s.startswith("(표)") and not s.startswith("<"):
+                        blob = re.sub(r"\s+", "", "".join(lines_txt))
+                        if re.sub(r"\s+", "", s) in blob:
+                            continue
+                        if re.sub(r"\s+", "", s).startswith("구분"):
+                            continue
+                        if re.search(r"매끈한마감|보통마감|거친마감", s):
+                            continue
                     lines_txt.append(s)
                 grp["notes"].extend(_note_items(lines_txt, pno))
 
+            # 쪽 넘김으로 그룹을 끝내지 않음: 첫머리 주석(⑤부터, 【단가정의】 없이 ①)을 이전 그룹에
+            first_group_y = min((e[0] for e in events if e[1] == "group"), default=None)
+            first_table_y = min((e[0] for e in events if e[1] == "table"), default=None)
+            first_notes_y = min((e[0] for e in events if e[1] == "notes"), default=None)
+            top_limit = page.rect.height
+            for y in (first_group_y, first_table_y):
+                if y is not None:
+                    top_limit = min(top_limit, y)
+            has_early_notes = first_notes_y is not None and first_notes_y < top_limit - 1
+            if last_group is not None and not has_early_notes and top_limit > 40:
+                attach_notes_from(8.0, top_limit, last_group)
+
             for i_ev, (ey, etype, payload) in enumerate(events):
-                next_y = events[i_ev + 1][0] if i_ev + 1 < len(events) else page.rect.height - 40
+                next_y = events[i_ev + 1][0] if i_ev + 1 < len(events) else page.rect.height - 12
                 if etype == "group":
                     current_group = new_group(payload)  # type: ignore[arg-type]
                     half_started = True
@@ -847,6 +1033,9 @@ def extract_pdf(
                     else:
                         table_x0 = hx0 + 40
                         table_x1 = hx1 - 40
+                    # 헤더에 단가가 없고 격자 가로선도 없으면 목록/색인
+                    if (lab is None or "price" not in lab) and not wide:
+                        continue
 
                     vxs = _vxs_near(vlines, y_min - 50, y_max + 20, table_x0, table_x1)
                     colmap = _build_columns(vxs, table_x0, table_x1, lab)
@@ -873,7 +1062,14 @@ def extract_pdf(
                         table_top = header_bottom
                     else:
                         top_lines = _wide_h_table(hlines, y_min - 30, y_min - 1, min_w * 0.5, table_x0, table_x1)
-                        table_top = min((h.c for h in top_lines), default=items_sorted[0][1].y0 - 8)
+                        if not top_lines:
+                            # 칸 단위 가로선(전체 폭 미만)도 표 상단
+                            for h in hlines:
+                                if not (y_min - 30 <= h.c <= y_min - 1):
+                                    continue
+                                if min(h.b, table_x1) - max(h.a, table_x0) >= 40:
+                                    top_lines.append(h)
+                        table_top = min((h.c for h in top_lines), default=items_sorted[0][1].y0 - 16)
 
                     bot_lines = _wide_h_table(
                         hlines, y_max + 2, min(next_y - 2, y_max + 55), min_w * 0.5, table_x0, table_x1
@@ -928,6 +1124,15 @@ def extract_pdf(
                             if has_remark
                             else ""
                         )
+
+                        # 코드 열이 명칭 첫 글자를 삼킨 경우(맹암거, PHC, L형…) 되돌림
+                        gap_txt = _text_in(chars, code_col[0], name_col[0], y0, y1)
+                        gap_txt = CODE_FIND.sub("", gap_txt)
+                        gap_txt = STAR_FIND.sub("", gap_txt)
+                        gap_txt = re.sub(r"\s+", "", gap_txt)
+                        if gap_txt and gap_txt not in (code,):
+                            if not re.sub(r"\s+", "", name_raw).startswith(gap_txt):
+                                name_raw = gap_txt + name_raw
 
                         # 코드 문자열이 명칭에 섞이면 제거
                         if name_raw.startswith(code):
@@ -989,6 +1194,10 @@ def extract_pdf(
 
                         # 단가 없는 코드는 본문 아님 (이중 방어)
                         if status == "present" and price is None and "폐지" not in (price_tok or ""):
+                            continue
+                        if status == "present" and price_tok and not _price_word_complete(
+                            price_tok, words_all, price_col, y0, y1
+                        ):
                             continue
 
                         rec = {
