@@ -12,9 +12,11 @@ from typing import Any
 import pymupdf as fitz
 
 CODE_RE = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
+CODE_FULL = re.compile(r"^[A-Z]{2}\d{3}\.\d{5}$")
 STAR_RE = re.compile(r"[A-Z]{2}\d{3}\.\d+\*")
 PRICE_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$|^\d+$")
 LABOR_RE = re.compile(r"^\d+(?:\.\d+)?%$")
+HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
 HEADER_NORM = {
     "공종코드": "code",
     "공종명칭": "name",
@@ -123,7 +125,11 @@ def _is_price_tok(t: str) -> bool:
     s = t.strip().replace(" ", "")
     if "폐지" in s:
         return True
+    if s == "폐기":
+        return True
     if LABOR_RE.match(s):
+        return True
+    if HALF_LABOR_RE.match(s):
         return True
     if PRICE_RE.match(s) and ("," in s or len(s) >= 4):
         return True
@@ -510,6 +516,57 @@ def _inserted_space(word: str, field: str) -> bool:
     return False
 
 
+def _note_events(
+    words: list[tuple[float, float, float, float, str]],
+    x0: float,
+    x1: float,
+) -> list[tuple[float, str]]:
+    ev: list[tuple[float, str]] = []
+    for y in _group_ys(words, x0, x1):
+        ev.append((y, "group"))
+    for y in _danga_ys(words, x0, x1):
+        ev.append((y, "danga"))
+    ev.sort(key=lambda e: e[0])
+    return ev
+
+
+def _in_note_at(y: float, events: list[tuple[float, str]], in_note: bool) -> bool:
+    flag = in_note
+    for ey, et in events:
+        if ey >= y:
+            break
+        flag = et == "danga"
+    return flag
+
+
+def _end_in_note(events: list[tuple[float, str]], in_note: bool) -> bool:
+    flag = in_note
+    for _ey, et in events:
+        flag = et == "danga"
+    return flag
+
+
+def _line_start_codes(
+    words: list[tuple[float, float, float, float, str]],
+    x0: float,
+    x1: float,
+) -> list[tuple[str, float, str]]:
+    """같은 반·같은 줄에서 왼쪽에 낱말이 없는 공종코드. (code, yc, line_text)."""
+    half = [w for w in words if x0 - 1 <= (w[0] + w[2]) / 2 < x1 + 1]
+    out: list[tuple[str, float, str]] = []
+    for line in _cluster_word_lines(half, gap=4.0):
+        line = sorted(line, key=lambda w: w[0])
+        if not line:
+            continue
+        first = line[0][4].strip()
+        if not CODE_FULL.match(first):
+            continue
+        yc = sum((w[1] + w[3]) / 2.0 for w in line) / len(line)
+        txt = " ".join(w[4] for w in line)
+        out.append((first, yc, txt))
+    return out
+
+
 def check_conservation(
     pdf_path: str | Path,
     result: dict[str, Any],
@@ -522,19 +579,32 @@ def check_conservation(
     end = min(doc.page_count, end)
 
     recs_by_page: dict[int, list[dict]] = {}
+    rec_halves: set[tuple[int, str]] = set()
+    recorded: set[tuple[str, int]] = set()
     for rec in result.get("records") or []:
         recs_by_page.setdefault(int(rec["pdf_page"]), []).append(rec)
+        rec_halves.add((int(rec["pdf_page"]), rec.get("page_half") or "C"))
+        recorded.add((str(rec.get("code") or ""), int(rec["pdf_page"])))
     subs_by_page: dict[int, list[dict]] = {}
     for sub in result.get("subheaders") or []:
         subs_by_page.setdefault(int(sub["pdf_page"]), []).append(sub)
 
     page_reports: list[dict[str, Any]] = []
     tot_body = tot_assigned = tot_missing = tot_dup = tot_split = 0
-    tot_lost = tot_ins = 0
+    tot_lost = tot_ins = tot_unrec = 0
     split_all: list[dict[str, Any]] = []
     lost_all: list[dict[str, Any]] = []
     inserted_all: list[dict[str, Any]] = []
     digit_only_all: list[dict[str, Any]] = []
+    unrec_all: list[dict[str, Any]] = []
+
+    in_note = False
+    if start > 1:
+        for pno in range(1, start):
+            page = doc[pno - 1]
+            words_pre = _words(page)
+            for _ph, hx0, hx1 in _halves(page):
+                in_note = _end_in_note(_note_events(words_pre, hx0, hx1), in_note)
 
     for pno in range(start, end + 1):
         page = doc[pno - 1]
@@ -698,6 +768,25 @@ def check_conservation(
                             lost_all.append(item_lost)
                             break
 
+        unrecorded: list[dict[str, Any]] = []
+        for ph, hx0, hx1 in _halves(page):
+            ev = _note_events(words, hx0, hx1)
+            if (pno, ph) in rec_halves:
+                for code, yc, txt in _line_start_codes(words, hx0, hx1):
+                    if _in_note_at(yc, ev, in_note):
+                        continue
+                    if (code, pno) in recorded:
+                        continue
+                    item_u = {
+                        "code": code,
+                        "pdf_page": pno,
+                        "page_half": ph,
+                        "line": txt,
+                    }
+                    unrecorded.append(item_u)
+                    unrec_all.append(item_u)
+            in_note = _end_in_note(ev, in_note)
+
         page_reports.append(
             {
                 "pdf_page": pno,
@@ -708,11 +797,13 @@ def check_conservation(
                 "split_words_count": len(split_words),
                 "lost_spaces_count": len(lost_spaces),
                 "inserted_spaces_count": len(inserted_spaces),
+                "unrecorded_codes_count": len(unrecorded),
                 "missing": missing,
                 "duplicate": duplicate,
                 "split_words": split_words,
                 "lost_spaces": lost_spaces,
                 "inserted_spaces": inserted_spaces,
+                "unrecorded_codes": unrecorded,
             }
         )
         tot_body += len(body_words)
@@ -722,6 +813,7 @@ def check_conservation(
         tot_split += len(split_words)
         tot_lost += len(lost_spaces)
         tot_ins += len(inserted_spaces)
+        tot_unrec += len(unrecorded)
 
     doc.close()
     return {
@@ -730,6 +822,7 @@ def check_conservation(
         "split_words": split_all,
         "lost_spaces": lost_all,
         "inserted_spaces": inserted_all,
+        "unrecorded_codes": unrec_all,
         "digit_only": digit_only_all,
         "totals": {
             "body_words": tot_body,
@@ -739,11 +832,13 @@ def check_conservation(
             "split_words": tot_split,
             "lost_spaces": tot_lost,
             "inserted_spaces": tot_ins,
+            "unrecorded_codes": tot_unrec,
             "digit_only": len(digit_only_all),
             "pass": tot_missing == 0
             and tot_dup == 0
             and tot_split == 0
             and tot_lost == 0
-            and tot_ins == 0,
+            and tot_ins == 0
+            and tot_unrec == 0,
         },
     }

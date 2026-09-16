@@ -72,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             f"split_words={tot.get('split_words')} "
             f"lost_spaces={tot.get('lost_spaces')} "
             f"inserted_spaces={tot.get('inserted_spaces')} "
+            f"unrecorded_codes={tot.get('unrecorded_codes')} "
             f"pass={tot.get('pass')}",
             flush=True,
         )

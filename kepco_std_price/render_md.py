@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -14,6 +15,8 @@ def _esc(s: str | None) -> str:
 
 def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> None:
     md_dir = Path(md_dir)
+    if md_dir.exists():
+        shutil.rmtree(md_dir)
     md_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict] = result.get("records") or []
     groups: list[dict] = result.get("groups") or []
@@ -25,22 +28,18 @@ def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> None:
     page_range = f"{min(page_nums)}-{max(page_nums)}" if page_nums else ""
 
     gmap = {g["group_id"]: g for g in groups}
-    by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    by_key: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
     for r in records:
-        field = r.get("field") or "_"
-        major = r.get("major") or r["code"][0]
-        by_key[(field, major)].append(r)
+        g = gmap.get(r.get("group_id")) or {}
+        field = g.get("field") or r.get("field") or "_"
+        major = g.get("major") or r.get("major") or r["code"][0]
+        major_name = g.get("major_name") or ""
+        by_key[(field, major, major_name)].append(r)
 
     # preserve group order
     group_order = [g["group_id"] for g in groups]
 
-    for (field, major), recs in by_key.items():
-        major_name = ""
-        for r in recs:
-            g = gmap.get(r.get("group_id"))
-            if g and g.get("major_name"):
-                major_name = g["major_name"]
-                break
+    for (field, major, major_name), recs in by_key.items():
         safe_name = re.sub(r'[\\/:*?"<>|]', "_", major_name)
         fname = f"{major}_{safe_name}.md" if safe_name else f"{major}_.md"
         dest_dir = md_dir / field
@@ -77,7 +76,7 @@ def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> None:
             lines.append("|---|---|---|---|---|---|---|")
             for r in buckets[gid]:
                 if r.get("status") == "abolished":
-                    price_cell = "폐지"
+                    price_cell = r.get("price_raw") or "폐지"
                     labor_cell = r.get("abolished_at") or r.get("labor_raw") or ""
                 else:
                     price_cell = r.get("price_raw") or ""

@@ -34,7 +34,10 @@ DEFAULT7 = DEFAULT6 + ["remark"]
 FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야자체표준시장단가")
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton"}
-BANNER_RE = re.compile(r"대분류\s*([A-Z])(?:\s*[,，]\s*([A-Z]))?")
+BANNER_RE = re.compile(r"대분류\s*([A-Z])(?:\s*[,，]\s*([A-Z]))?\s*(.*)$")
+BANNER_TRAIL_RE = re.compile(r"[·.…⋯]+.*$")
+HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
+_EV_ORDER = {"banner": 0, "group": 1, "table": 2, "notes": 3}
 
 
 @dataclass
@@ -438,43 +441,63 @@ def _line_text_at(spans: list[Span], yc: float, x0: float, x1: float, tol: float
     return _collapse(_join_line(row))
 
 
+def _is_half_labor(t: str) -> bool:
+    return bool(HALF_LABOR_RE.match((t or "").strip().replace(" ", "")))
+
+
+def _major_name_from(raw: str) -> str:
+    """배너 이름: 글자 사이 공백 제거, 괄호 유지. 목차 점선·쪽번호 제거."""
+    t = BANNER_TRAIL_RE.sub("", raw or "")
+    t = re.sub(r"\d+\s*$", "", t)
+    t = t.replace("■", "")
+    t = re.sub(r"\s+", "", t)
+    if CODE_FIND.search(t) or "공종코드" in t or "공종명" in t:
+        return ""
+    if len(t) > 24:
+        return ""
+    if not re.search(r"[가-힣]{2,}", t):
+        return ""
+    return t
+
+
+def _parse_banner_line(line: str) -> tuple[str, str] | None:
+    """합쳐진 배너는 major=첫 글자, 이름은 나머지. 대분류Q, R 기타공사 → (Q, 기타공사)."""
+    if "대분류" not in (line or "").replace(" ", ""):
+        return None
+    for src in (line, re.sub(r"\s+", "", line)):
+        m = BANNER_RE.search(src)
+        if m:
+            return m.group(1), _major_name_from(m.group(3) or "")
+    return None
+
+
 def _banner(spans: list[Span], x0: float, x1: float) -> list[tuple[float, str, str]]:
-    """(yc, letter, name) 대분류 배너."""
-    found = []
-    for s in spans:
-        if not (x0 <= s.xc < x1):
+    """(yc, letter, name) 대분류 배너. 같은 줄(대분류 D 토공사) 우선, 없으면 아래 줄."""
+    seeds = [s for s in spans if x0 - 1 <= s.xc < x1 + 1 and "대분류" in s.text]
+    found: list[tuple[float, str, str]] = []
+    for s in seeds:
+        line = _line_text_at(spans, s.yc, x0, x1, tol=12)
+        parsed = _parse_banner_line(line) or _parse_banner_line(s.text)
+        if parsed is None:
             continue
-        m = BANNER_RE.search(s.text.replace(" ", ""))
-        if not m and "대분류" in s.text:
-            # '대분류' + 옆 글자
-            rest = _line_text_at(spans, s.yc, x0, x1)
-            m = BANNER_RE.search(rest.replace(" ", ""))
-            line = rest
-        else:
-            line = s.text
-        if not m:
-            continue
-        letter = m.group(1)
-        # 이름: 같은 상자/바로 아래 줄
-        name = ""
-        below = [
-            t
-            for t in spans
-            if x0 <= t.xc < x1 and s.y1 - 2 <= t.y0 <= s.y1 + 40 and t is not s
-        ]
-        below_txt = _collapse(_join_line(sorted(below, key=lambda z: (z.y0, z.x0))))
-        below_txt = BANNER_RE.sub("", below_txt.replace("대분류", ""))
-        below_txt = re.sub(r"^[A-Z]\s*", "", below_txt).strip()
-        if "■" in below_txt or CODE_FIND.search(below_txt) or "공종코드" in below_txt:
-            below_txt = ""
-        name = re.sub(r"\s+", "", below_txt)
-        if len(name) > 24:
-            name = ""
+        letter, name = parsed
+        if not name:
+            below = [
+                t
+                for t in spans
+                if x0 <= t.xc < x1 and s.y1 - 2 <= t.y0 <= s.y1 + 40 and t is not s
+            ]
+            below_txt = _collapse(_join_line(sorted(below, key=lambda z: (z.y0, z.x0))))
+            below_txt = BANNER_RE.sub("", below_txt.replace("대분류", ""))
+            below_txt = re.sub(r"^[A-Z]\s*", "", below_txt).strip()
+            if "■" in below_txt or CODE_FIND.search(below_txt) or "공종코드" in below_txt:
+                below_txt = ""
+            name = _major_name_from(below_txt)
         found.append((s.yc, letter, name))
-    # unique by letter near same y
-    uniq = []
+    found.sort(key=lambda it: it[0])
+    uniq: list[tuple[float, str, str]] = []
     for item in found:
-        if not uniq or abs(item[0] - uniq[-1][0]) > 20 or item[1] != uniq[-1][1]:
+        if not uniq or abs(item[0] - uniq[-1][0]) > 20:
             uniq.append(item)
     return uniq
 
@@ -508,7 +531,11 @@ def _is_real_price_tok(t: str) -> bool:
         return False
     if "폐지" in s:
         return True
+    if s == "폐기":
+        return True
     if LABOR_RE.match(s):
+        return True
+    if HALF_LABOR_RE.match(s):
         return True
     if PRICE_RE.match(s) and ("," in s or len(s) >= 4):
         return True
@@ -930,6 +957,18 @@ def extract_pdf(
     last_major_name = ""
     group_seq = 0
 
+    # --pages 중간부터여도 앞쪽 배너를 읽어 대분류를 이어받는다
+    if start > 1:
+        for pno in range(1, start):
+            page = doc[pno - 1]
+            _layout, halves_pre = _halves(page)
+            spans_pre = _page_spans(page)
+            for _ph, hx0, hx1 in halves_pre:
+                spans = [s for s in spans_pre if _in_half(s, hx0, hx1)]
+                for _yc, letter, name in _banner(spans, hx0, hx1):
+                    last_major = letter
+                    last_major_name = name
+
     for pno in range(start, end + 1):
         page = doc[pno - 1]
         layout, halves = _halves(page)
@@ -960,10 +999,6 @@ def extract_pdf(
             headers = _header_labels(spans, hx0, hx1)
             gheads = _group_headers(spans, hx0, hx1)
             banners = _banner(spans, hx0, hx1)
-            for _yc, letter, name in banners:
-                last_major = letter
-                if name:
-                    last_major_name = name
 
             codes_all, stars_all = _codes_and_stars(spans, hx0, hx1)
             # 단가 판정은 반 폭이 아니라 이 표의 실제 x
@@ -1009,16 +1044,18 @@ def extract_pdf(
             if cur:
                 clusters.append(cur)
 
-            # y-ordered events: group headers + clusters + 단가정의 라벨만
+            # y-ordered events: 배너 + group headers + clusters + 단가정의 라벨
             dangas = [s for s in spans if _is_danga_label(s.text)]
             events: list[tuple[float, str, object]] = []
+            for yc, letter, name in banners:
+                events.append((yc, "banner", (letter, name)))
             for g in gheads:
                 events.append((g.yc, "group", g))
             for cl in clusters:
                 events.append((cl[0][1].yc, "table", cl))
             for d in dangas:
                 events.append((d.yc, "notes", d))
-            events.sort(key=lambda e: e[0])
+            events.sort(key=lambda e: (e[0], _EV_ORDER.get(e[1], 9)))
 
             current_group = None  # assigned after first ■ on this half
             half_started = False
@@ -1157,7 +1194,11 @@ def extract_pdf(
 
             for i_ev, (ey, etype, payload) in enumerate(events):
                 next_y = events[i_ev + 1][0] if i_ev + 1 < len(events) else page.rect.height - 12
-                if etype == "group":
+                if etype == "banner":
+                    letter, name = payload  # type: ignore[misc]
+                    last_major = letter
+                    last_major_name = name
+                elif etype == "group":
                     current_group = new_group(payload)  # type: ignore[arg-type]
                     half_started = True
                 elif etype == "table":
@@ -1334,7 +1375,7 @@ def extract_pdf(
                         for s in spans:
                             if labor_col[0] - 2 <= s.xc < labor_col[1] + 4 and y0 < s.yc < y1:
                                 t = s.text.strip().replace(" ", "")
-                                if LABOR_RE.match(t) or re.match(r"^[‘'′`]?\d{2}[상하]", t):
+                                if LABOR_RE.match(t) or _is_half_labor(t):
                                     labor_tok = s.text.strip()
                                     break
                         if not labor_tok:
@@ -1342,6 +1383,11 @@ def extract_pdf(
 
                         price_raw, price, status = _parse_price(price_tok or price_raw0)
                         labor_raw, labor_ratio = _parse_labor(labor_tok)
+                        # 단가 칸이 숫자가 아니고 노무비율이 ‘YY상/하 이면 폐지 레코드
+                        if status == "present" and price is None and _is_half_labor(labor_tok or labor_raw0):
+                            raw = (price_tok or price_raw0 or "").strip()
+                            if raw:
+                                price_raw, price, status = raw, None, "abolished"
                         abolished_at = None
                         if status == "abolished":
                             labor_ratio = None
