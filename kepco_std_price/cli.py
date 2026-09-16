@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from .conservation import check_conservation
 from .extract import extract_pdf
 from .render_md import render_md
 
@@ -34,6 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--half", required=True, help="예: 2025H2")
     ap.add_argument("--pages", default=None, help="예: 46-95 (없으면 전체)")
     ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--check-conservation",
+        action="store_true",
+        help="표 본문 낱말이 레코드 필드에 빠짐·중복 없이 들어갔는지 검사",
+    )
     args = ap.parse_args(argv)
 
     pages = _parse_pages(args.pages)
@@ -45,6 +51,19 @@ def main(argv: list[str] | None = None) -> int:
     _write_jsonl(out / "subheaders.jsonl", result["subheaders"])
     _write_jsonl(out / "pages.jsonl", result["pages"])
     render_md(result, out / "md", pdf_name=Path(args.pdf).name)
+    if args.check_conservation:
+        report = check_conservation(args.pdf, result, pages=pages)
+        (out / "conservation.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tot = report.get("totals") or {}
+        print(
+            f"conservation: body={tot.get('body_words')} assigned={tot.get('assigned')} "
+            f"missing={tot.get('missing')} duplicate={tot.get('duplicate')} "
+            f"pass={tot.get('pass')}",
+            flush=True,
+        )
     return 0
 
 

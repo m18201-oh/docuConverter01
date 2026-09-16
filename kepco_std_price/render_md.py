@@ -25,14 +25,16 @@ def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> None:
     page_range = f"{min(page_nums)}-{max(page_nums)}" if page_nums else ""
 
     gmap = {g["group_id"]: g for g in groups}
-    by_major: dict[str, list[dict]] = defaultdict(list)
+    by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for r in records:
-        by_major[r.get("major") or r["code"][0]].append(r)
+        field = r.get("field") or "_"
+        major = r.get("major") or r["code"][0]
+        by_key[(field, major)].append(r)
 
     # preserve group order
     group_order = [g["group_id"] for g in groups]
 
-    for major, recs in by_major.items():
+    for (field, major), recs in by_key.items():
         major_name = ""
         for r in recs:
             g = gmap.get(r.get("group_id"))
@@ -41,6 +43,8 @@ def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> None:
                 break
         safe_name = re.sub(r'[\\/:*?"<>|]', "_", major_name)
         fname = f"{major}_{safe_name}.md" if safe_name else f"{major}_.md"
+        dest_dir = md_dir / field
+        dest_dir.mkdir(parents=True, exist_ok=True)
         # records grouped
         buckets: dict[str, list[dict]] = defaultdict(list)
         for r in recs:
@@ -102,4 +106,4 @@ def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> None:
                     lines.append(n.get("item") or "")
             lines.append("")
 
-        (md_dir / fname).write_text("\n".join(lines), encoding="utf-8")
+        (dest_dir / fname).write_text("\n".join(lines), encoding="utf-8")

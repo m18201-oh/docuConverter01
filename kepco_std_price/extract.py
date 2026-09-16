@@ -26,8 +26,12 @@ HEADER_MAP = {
     "단위": "unit",
     "단가": "price",
     "노무비율": "labor",
+    "비고": "remark",
 }
+HEADER_NORM = {k.replace(" ", ""): v for k, v in HEADER_MAP.items()}
 DEFAULT6 = ["code", "name", "spec", "unit", "price", "labor"]
+DEFAULT7 = DEFAULT6 + ["remark"]
+FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야자체표준시장단가")
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton"}
 BANNER_RE = re.compile(r"대분류\s*([A-Z])(?:\s*[,，]\s*([A-Z]))?")
@@ -255,20 +259,30 @@ def _parse_labor(raw: str) -> tuple[str, float | None]:
 
 
 def _printed(spans: list[Span], x0: float, x1: float, page_h: float) -> int | None:
-    bot = [s for s in spans if s.y0 > page_h * 0.88 and x0 <= s.xc < x1]
-    bot.sort(key=lambda s: s.x0)
-    texts = [s.text.strip() for s in bot]
-    for i in range(len(texts) - 2):
-        if texts[i] == "-" and texts[i + 2] == "-" and texts[i + 1].isdigit():
-            return int(texts[i + 1])
-    joined = " ".join(texts)
-    m = re.search(r"-\s*(\d+)\s*-", joined)
-    return int(m.group(1)) if m else None
+    def _from(ys: list[Span]) -> int | None:
+        ys = sorted(ys, key=lambda s: s.x0)
+        texts = [s.text.strip() for s in ys]
+        for i in range(len(texts) - 2):
+            if texts[i] == "-" and texts[i + 2] == "-" and texts[i + 1].isdigit():
+                return int(texts[i + 1])
+        joined = " ".join(texts)
+        m = re.search(r"-\s*(\d+)\s*-", joined)
+        return int(m.group(1)) if m else None
+
+    hit = _from([s for s in spans if s.y0 > page_h * 0.88 and x0 <= s.xc < x1])
+    if hit is not None:
+        return hit
+    # 본문이 짧은 세로쪽: 인쇄쪽이 하단 12%보다 위에 온다
+    return _from([s for s in spans if s.y0 > page_h * 0.55 and x0 <= s.xc < x1])
+
+
+def _header_field(text: str) -> str | None:
+    return HEADER_NORM.get(text.strip().replace(" ", ""))
 
 
 def _header_labels(spans: list[Span], x0: float, x1: float) -> list[tuple[float, dict[str, float]]]:
     """같은 y 띠에 헤더 라벨이 3개 이상 모인 행."""
-    cands = [s for s in spans if s.text.strip() in HEADER_MAP and x0 <= s.xc < x1]
+    cands = [s for s in spans if _header_field(s.text) and x0 <= s.xc < x1]
     cands.sort(key=lambda s: s.yc)
     rows: list[list[Span]] = []
     for s in cands:
@@ -278,11 +292,18 @@ def _header_labels(spans: list[Span], x0: float, x1: float) -> list[tuple[float,
             rows[-1].append(s)
     out = []
     for row in rows:
-        labels = {}
-        for s in row:
-            labels[HEADER_MAP[s.text.strip()]] = s.xc
+        yc = sum(s.yc for s in row) / len(row)
+        band = [s for s in spans if x0 <= s.xc < x1 and abs(s.yc - yc) <= 8]
+        labels: dict[str, float] = {}
+        for s in band:
+            key = _header_field(s.text)
+            if key:
+                labels[key] = s.xc
+        if "name" not in labels:
+            pieces = [s for s in band if s.text.strip() in ("공", "종", "명")]
+            if len(pieces) >= 3:
+                labels["name"] = sum(s.xc for s in pieces) / len(pieces)
         if len(set(labels)) >= 3:
-            yc = sum(s.yc for s in row) / len(row)
             y1 = max(s.y1 for s in row)
             out.append((yc, labels, y1, min(s.y0 for s in row)))
     return out  # type: ignore[return-value]
@@ -406,13 +427,39 @@ def _wide_h(hlines: list[LineSeg], y0: float, y1: float, min_w: float) -> list[L
     return [h for h in hlines if y0 <= h.c <= y1 and (h.b - h.a) >= min_w]
 
 
+def _wide_h_table(
+    hlines: list[LineSeg],
+    y0: float,
+    y1: float,
+    min_w: float,
+    tx0: float,
+    tx1: float,
+) -> list[LineSeg]:
+    need = min(min_w, max(40.0, (tx1 - tx0) * 0.5))
+    out = []
+    for h in hlines:
+        if not (y0 <= h.c <= y1):
+            continue
+        if (h.b - h.a) < min_w * 0.5:
+            continue
+        if min(h.b, tx1) - max(h.a, tx0) >= need:
+            out.append(h)
+    return out
+
+
 def _build_columns(
     vxs: list[float],
     table_x0: float,
     table_x1: float,
     labels: dict[str, float] | None,
 ) -> dict[str, tuple[float, float]]:
-    bounds = [table_x0] + vxs + [table_x1]
+    extra = []
+    if labels and len(labels) >= 2 and len(vxs) < max(5, len(labels) - 1):
+        xs = sorted(labels.values())
+        extra = [(xs[i] + xs[i + 1]) / 2 for i in range(len(xs) - 1)]
+    elif labels and "remark" in labels and "labor" in labels:
+        extra.append((labels["labor"] + labels["remark"]) / 2)
+    bounds = [table_x0] + vxs + extra + [table_x1]
     bounds = _cluster_xs(bounds, tol=3.0)
     cols: list[tuple[float, float]] = []
     for i in range(len(bounds) - 1):
@@ -429,8 +476,13 @@ def _build_columns(
                         best_i, best_d = i, d
             if best_i is not None:
                 names[best_i] = name
+    want_remark = bool(labels and "remark" in labels) or len(cols) >= 7
+    pool = DEFAULT7 if want_remark else DEFAULT6
     if names.count(None) == len(names):
-        if len(cols) >= 6:
+        if len(cols) >= 7:
+            names = list(DEFAULT7) + [None] * (len(cols) - 7)
+            names = names[: len(cols)]
+        elif len(cols) >= 6:
             names = list(DEFAULT6) + [None] * (len(cols) - 6)
             names = names[: len(cols)]
         elif len(cols) == 5:
@@ -438,11 +490,10 @@ def _build_columns(
         elif len(cols) == 4:
             names = ["name", "spec", "unit", "price"]
     else:
-        # fill holes from leftover default order
         used = {n for n in names if n}
         for i, n in enumerate(names):
             if n is None:
-                for cand in DEFAULT6:
+                for cand in pool:
                     if cand not in used:
                         names[i] = cand
                         used.add(cand)
@@ -453,13 +504,13 @@ def _build_columns(
             colmap[n] = (a, b)
     if "labor" not in colmap and "price" in colmap:
         px0, px1 = colmap["price"]
-        if table_x1 - px1 > 20:
-            colmap["labor"] = (px1, table_x1)
+        right_lim = colmap["remark"][0] if "remark" in colmap else table_x1
+        if right_lim - px1 > 20:
+            colmap["labor"] = (px1, right_lim)
         elif "labor" not in colmap:
-            # price may include labor; split last 40%
             split = px0 + (px1 - px0) * 0.55
             colmap["price"] = (px0, split)
-            colmap["labor"] = (split, max(px1, table_x1))
+            colmap["labor"] = (split, max(px1, right_lim))
     if "code" not in colmap and "name" in colmap:
         nx0, nx1 = colmap["name"]
         if nx0 - table_x0 > 30:
@@ -512,6 +563,75 @@ def _flatten_subtable(table) -> str:
     return "(표) " + body if body.strip() else ""
 
 
+def _scan_fields(doc: fitz.Document) -> list[tuple[int, str]]:
+    """파일 전체에서 분야 경계를 훑는다. (page, field_name) 오름차순."""
+    starts: list[tuple[int, str]] = []
+    for i in range(doc.page_count):
+        compact = doc[i].get_text("text").replace(" ", "").replace("\n", "")
+        m = FIELD_RE.search(compact)
+        if m:
+            starts.append((i + 1, m.group(1)))
+    return starts
+
+
+def _field_at(starts: list[tuple[int, str]], pno: int) -> str | None:
+    name = None
+    for sp, fn in starts:
+        if sp <= pno:
+            name = fn
+        else:
+            break
+    return name
+
+
+def _row_bands(
+    centers: list[float],
+    hlines: list[LineSeg],
+    table_x0: float,
+    table_x1: float,
+    table_top: float,
+    table_bottom: float,
+) -> list[tuple[float, float]]:
+    """행 띠. 가로 테두리선이 있으면 우선, 없으면 코드 y 중간점."""
+    table_w = table_x1 - table_x0
+    min_overlap = max(40.0, table_w * 0.55)
+    ys: list[float] = []
+    for h in hlines:
+        if not (table_top - 1.8 <= h.c <= table_bottom + 1.8):
+            continue
+        ox0, ox1 = max(h.a, table_x0), min(h.b, table_x1)
+        if ox1 - ox0 < min_overlap:
+            continue
+        ys.append(h.c)
+    hys = _cluster_xs(ys, tol=1.6)
+    bounds = [table_top]
+    for y in hys:
+        if y - bounds[-1] > 2.0 and table_bottom - y > 2.0:
+            bounds.append(y)
+    if table_bottom - bounds[-1] > 1.0:
+        bounds.append(table_bottom)
+    else:
+        bounds[-1] = table_bottom
+
+    bands: list[tuple[float, float]] = []
+    for i, cyc in enumerate(centers):
+        above = [b for b in bounds if b < cyc - 0.8]
+        below = [b for b in bounds if b > cyc + 0.8]
+        y0 = max(above) if above else table_top
+        y1 = min(below) if below else table_bottom
+        prev = centers[i - 1] if i else None
+        nxt = centers[i + 1] if i + 1 < len(centers) else None
+        if prev is not None and y0 < prev:
+            y0 = (prev + cyc) / 2
+        if nxt is not None and y1 > nxt:
+            y1 = (cyc + nxt) / 2
+        if y1 <= y0 + 0.5:
+            y0 = (prev + cyc) / 2 if prev is not None else table_top
+            y1 = (cyc + nxt) / 2 if nxt is not None else table_bottom
+        bands.append((y0, y1))
+    return bands
+
+
 def extract_pdf(
     pdf_path: str | Path,
     half: str,
@@ -520,6 +640,7 @@ def extract_pdf(
     pdf_path = Path(pdf_path)
     sha = _sha256(pdf_path)
     doc = fitz.open(pdf_path)
+    field_starts = _scan_fields(doc)
     start, end = (1, doc.page_count) if pages is None else pages
     start = max(1, start)
     end = min(doc.page_count, end)
@@ -538,6 +659,7 @@ def extract_pdf(
     for pno in range(start, end + 1):
         page = doc[pno - 1]
         layout, halves = _halves(page)
+        page_field = _field_at(field_starts, pno)
         spans_all = _page_spans(page)
         chars_all = _page_chars(page)
         hlines, vlines = _page_lines(page)
@@ -626,6 +748,7 @@ def extract_pdf(
                     "header": header,
                     "major": last_major,
                     "major_name": last_major_name,
+                    "field": page_field,
                     "notes": [],
                     "record_count": 0,
                 }
@@ -675,7 +798,7 @@ def extract_pdf(
                         continue
                     if s in HEADER_MAP or s.replace(" ", "") in HEADER_MAP:
                         continue
-                    if any(s.startswith(h) for h in ("공종코드", "공종명칭", "공종명", "규격", "단위", "단가", "노무비율")):
+                    if any(s.startswith(h) for h in ("공종코드", "공종명칭", "공종명", "규격", "단위", "단가", "노무비율", "비고", "비 고")):
                         continue
                     lines_txt.append(s)
                 grp["notes"].extend(_note_items(lines_txt, pno))
@@ -728,8 +851,13 @@ def extract_pdf(
                     vxs = _vxs_near(vlines, y_min - 50, y_max + 20, table_x0, table_x1)
                     colmap = _build_columns(vxs, table_x0, table_x1, lab)
                     if "code" not in colmap and last_colmap and "code" in last_colmap:
-                        # continuation fallback
-                        colmap = last_colmap
+                        old0 = min(a for a, _ in last_colmap.values())
+                        old1 = max(b for _, b in last_colmap.values())
+                        old_w = old1 - old0 or 1.0
+                        new_w = table_x1 - table_x0
+                        def _tx(x: float) -> float:
+                            return table_x0 + (x - old0) / old_w * new_w
+                        colmap = {k: (_tx(a), _tx(b)) for k, (a, b) in last_colmap.items()}
                     if colmap:
                         last_colmap = colmap
                         table_x0 = min(a for a, _ in colmap.values())
@@ -737,35 +865,27 @@ def extract_pdf(
 
                     # header bottom / table top
                     if header_yc is not None:
-                        hb_lines = _wide_h(hlines, header_yc, y_min - 2, min_w * 0.5)
+                        hb_lines = _wide_h_table(hlines, header_yc, y_min - 2, min_w * 0.5, table_x0, table_x1)
                         if hb_lines:
                             header_bottom = max(h.c for h in hb_lines)
                         else:
                             header_bottom = header_y1 if header_y1 else header_yc + 12
                         table_top = header_bottom
                     else:
-                        top_lines = _wide_h(hlines, y_min - 30, y_min - 1, min_w * 0.5)
+                        top_lines = _wide_h_table(hlines, y_min - 30, y_min - 1, min_w * 0.5, table_x0, table_x1)
                         table_top = min((h.c for h in top_lines), default=items_sorted[0][1].y0 - 8)
 
-                    bot_lines = _wide_h(hlines, y_max + 2, min(next_y - 2, y_max + 50), min_w * 0.5)
+                    bot_lines = _wide_h_table(
+                        hlines, y_max + 2, min(next_y - 2, y_max + 55), min_w * 0.5, table_x0, table_x1
+                    )
                     if bot_lines:
                         table_bottom = min(h.c for h in bot_lines)
                     else:
                         table_bottom = items_sorted[-1][1].y1 + 8
 
-                    # y bands via midpoints of ALL items (codes + stars)
+                    # 행 띠: 가로 테두리선 우선, 없으면 코드 y 중간점
                     centers = [sp.yc for _, sp in items_sorted]
-                    bands = []
-                    for i, cyc in enumerate(centers):
-                        if i == 0:
-                            y0 = table_top
-                        else:
-                            y0 = (centers[i - 1] + cyc) / 2
-                        if i == len(centers) - 1:
-                            y1 = table_bottom
-                        else:
-                            y1 = (cyc + centers[i + 1]) / 2
-                        bands.append((y0, y1))
+                    bands = _row_bands(centers, hlines, table_x0, table_x1, table_top, table_bottom)
 
                     current_sub = None  # (pattern, text)
                     fx = table_x0
@@ -776,6 +896,8 @@ def extract_pdf(
                     unit_col = _col(colmap, "unit", (spec_col[1], spec_col[1] + 40))
                     price_col = _col(colmap, "price", (unit_col[1], unit_col[1] + 70))
                     labor_col = _col(colmap, "labor", (price_col[1], tx))
+                    remark_col = colmap.get("remark")
+                    has_remark = remark_col is not None
 
                     prev_name = ""
                     for (kind, sp), (y0, y1) in zip(items_sorted, bands):
@@ -801,6 +923,11 @@ def extract_pdf(
                         unit_raw = _text_in(chars, unit_col[0], unit_col[1], y0, y1)
                         price_raw0 = _text_in(chars, price_col[0], price_col[1], y0, y1)
                         labor_raw0 = _text_in(chars, labor_col[0], labor_col[1], y0, y1)
+                        remark_raw = (
+                            _text_in(chars, remark_col[0], remark_col[1], y0, y1)
+                            if has_remark
+                            else ""
+                        )
 
                         # 코드 문자열이 명칭에 섞이면 제거
                         if name_raw.startswith(code):
@@ -869,6 +996,7 @@ def extract_pdf(
                             "code": code,
                             "half": half,
                             "major": code[0],
+                            "field": page_field,
                             "pdf_page": pno,
                             "page_half": ph,
                             "printed_page": printed,
@@ -901,6 +1029,9 @@ def extract_pdf(
                             rec["name_group"] = None
                         if abolished_at:
                             rec["abolished_at"] = abolished_at
+                        if has_remark:
+                            rec["remark_raw"] = remark_raw
+                            rec["remark"] = _collapse(remark_raw)
                         if grp is not None:
                             if not grp.get("major"):
                                 grp["major"] = code[0]
@@ -923,6 +1054,7 @@ def extract_pdf(
                 "printed": printed_map,
                 "width": int(round(page.rect.width)),
                 "height": int(round(page.rect.height)),
+                "field": page_field,
             }
         )
 
