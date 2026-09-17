@@ -70,10 +70,29 @@ class MdSummary:
         )
 
 
+# G02i2 F6: CommonMark 가 강조(*_)·링크([])·HTML(<>)·이스케이프(\)·코드(`) 로
+# 해석하는 글자를 역슬래시로 이스케이프한다("<사례1>" 같은 원문 표기가 HTML
+# 태그로 읽혀 뷰어에서 사라지지 않도록). "|" 는 표 칸에서만 별도로 다룬다
+# (표 밖 목록 줄·그림 제목에는 구조적 의미가 없다).
+_MD_SPECIAL_RE = re.compile(r"[\\`*_\[\]<>]")
+
+
+def _esc_md(s: str) -> str:
+    return _MD_SPECIAL_RE.sub(lambda m: "\\" + m.group(0), s)
+
+
 def _esc(s: str | None) -> str:
     if s is None:
         return ""
-    return str(s).replace("|", "\\|").replace("\n", " ")
+    t = _esc_md(str(s).replace("\n", " "))
+    return t.replace("|", "\\|")
+
+
+def _esc_text(s: str | None) -> str:
+    """주석 목록 줄·그림 제목: 표 칸과 같은 특수 글자 집합을 이스케이프한다(F6)."""
+    if s is None:
+        return ""
+    return _esc_md(str(s).replace("\n", " "))
 
 
 _UNSAFE_COMPONENT_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')  # 코치 핫픽스 09-17: NUL·제어문자도 치환(대분류 md 가 집계 없이 사라지던 경로)
@@ -310,20 +329,50 @@ def _remove_empty_dirs(md_dir: Path) -> None:
             pass
 
 
-def _build_md_contents(result: dict, pdf_name: str) -> dict[str, str]:
-    """레코드를 대분류별 Markdown 텍스트로 구성해 {md 기준 상대경로(posix): 내용} 을 돌려준다.
+def _pdf_link_target(md_dir: Path, pdf_path: str | Path | None, pdf_name: str) -> str:
+    """이 md 파일 위치(md_dir/<field>/<파일>.md, 항상 md_dir 바로 한 단 아래)에서
+    --pdf 절대 경로까지의 상대 경로. 다른 드라이브면 file:/// 절대 URI(N6).
 
-    기존 render_md 의 렌더링 로직과 동일(파일명·정렬·표 구성 변경 없음) — 이번 회차는
-    "쓰기 방식"만 안전하게 바꾼다.
+    pdf_path 가 없으면(예: selftest_md 의 합성 result) 이전처럼 파일명만 쓴다.
     """
+    if not pdf_path:
+        return pdf_name
+    try:
+        pdf_abs = Path(pdf_path).resolve()
+        # 산출되는 모든 md 파일은 md_dir 바로 한 단 아래(md_dir/<field>/<파일>.md)에
+        # 있으므로, 실제로 존재하지 않는 자리표시 폴더 하나만 붙여도 상대경로 "깊이"는
+        # 정확하다(os.path.relpath 는 실제 존재 여부를 보지 않는다).
+        file_dir = Path(md_dir).resolve() / "_field_"
+        rel = os.path.relpath(pdf_abs, start=file_dir)
+        # 코치 핫픽스 09-17(리뷰 확인): 파일·폴더 이름의 % # ? 가 뒤에 붙는 #page=N 과
+        # 섞이지 않게 백분율 부호화한다(한글·공백은 <…> 링크 안에서 그대로 둔다).
+        return Path(rel).as_posix().replace("%", "%25").replace("#", "%23").replace("?", "%3F")
+    except (ValueError, OSError):
+        try:
+            return Path(pdf_path).resolve().as_uri()
+        except Exception:  # noqa: BLE001
+            return pdf_name
+
+
+def _build_md_contents(
+    result: dict, pdf_name: str, md_dir: Path, pdf_path: str | Path | None = None
+) -> dict[str, str]:
+    """레코드를 대분류별 Markdown 텍스트로 구성해 {md 기준 상대경로(posix): 내용} 을 돌려준다."""
     records: list[dict] = result.get("records") or []
     groups: list[dict] = result.get("groups") or []
+    subheaders: list[dict] = result.get("subheaders") or []
     half = result.get("half") or ""
     sha = result.get("sha256") or ""
     pages = result.get("pages") or []
     layout = pages[0]["layout"] if pages else ""
     page_nums = [p["pdf_page"] for p in pages]
     page_range = f"{min(page_nums)}-{max(page_nums)}" if page_nums else ""
+    pdf_rel = _pdf_link_target(md_dir, pdf_path, pdf_name)
+
+    def _link(pdf_page: int | None) -> str:
+        if pdf_page is None:
+            return ""
+        return f"[p.{pdf_page}](<{pdf_rel}#page={pdf_page}>)"
 
     gmap = {g["group_id"]: g for g in groups}
     by_key: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
@@ -335,6 +384,10 @@ def _build_md_contents(result: dict, pdf_name: str) -> dict[str, str]:
         by_key[(field_, major, major_name)].append(r)
 
     group_order = [g["group_id"] for g in groups]
+
+    subs_by_group: dict[str, list[dict]] = defaultdict(list)
+    for s in subheaders:
+        subs_by_group[s.get("group_id") or "_"].append(s)
 
     contents: dict[str, str] = {}
     for (field_, major, major_name), recs in by_key.items():
@@ -373,54 +426,85 @@ def _build_md_contents(result: dict, pdf_name: str) -> dict[str, str]:
             gname = g.get("major_name") or major_name
             printed = g.get("printed_page")
             extra = f" (인쇄 {printed}쪽)" if printed else ""
-            lines.append(f"## ■ {header}   (대분류 {gmajor} {gname}){extra}")
+            lines.append(f"## ■ {_esc_text(header)}   (대분류 {_esc_text(gmajor)} {_esc_text(gname)}){extra}")  # 코치 핫픽스 09-17: 제목 줄도 F6 기준
             lines.append("")
-            lines.append("| 공종코드 | 공종명칭 | 규격 | 단위 | 단가 | 노무비율 | 원문 |")
-            lines.append("|---|---|---|---|---|---|---|")
-            for r in buckets[gid]:
+            group_recs = buckets[gid]
+            # N4: 이 그룹에 비고가 있는 레코드가 하나라도 있으면 비고 열을 더한다.
+            has_remark = any((r.get("remark") or "").strip() for r in group_recs)
+            if has_remark:
+                lines.append("| 공종코드 | 공종명칭 | 규격 | 단위 | 단가 | 노무비율 | 비고 | 원문 |")
+                lines.append("|---|---|---|---|---|---|---|---|")
+            else:
+                lines.append("| 공종코드 | 공종명칭 | 규격 | 단위 | 단가 | 노무비율 | 원문 |")
+                lines.append("|---|---|---|---|---|---|---|")
+            # N4: 소제목(subheaders.jsonl) 행을 그 소제목을 이어받는 레코드들 앞에
+            # 한 행으로 넣는다(공종코드 칸 = 코드 패턴, 공종명칭 칸 = 굵게 소제목 텍스트).
+            sub_map = {s.get("code_pattern"): s for s in subs_by_group.get(gid, [])}
+            emitted_patterns: set[str] = set()
+            for r in group_recs:
+                ng = r.get("name_group")
+                if ng and ng in sub_map and ng not in emitted_patterns:
+                    s = sub_map[ng]
+                    emitted_patterns.add(ng)
+                    sub_cells = [
+                        _esc(s.get("code_pattern")),
+                        f"**{_esc(s.get('text'))}**",
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                    if has_remark:
+                        sub_cells.append("")
+                    sub_cells.append(_link(s.get("pdf_page")))
+                    lines.append("| " + " | ".join(sub_cells) + " |")
                 if r.get("status") == "abolished":
                     price_cell = r.get("price_raw") or "폐지"
                     labor_cell = r.get("abolished_at") or r.get("labor_raw") or ""
                 else:
                     price_cell = r.get("price_raw") or ""
                     labor_cell = r.get("labor_raw") or ""
-                link = f"[p.{r['pdf_page']}]({pdf_name}#page={r['pdf_page']})"
-                lines.append(
-                    "| "
-                    + " | ".join(
-                        [
-                            _esc(r.get("code")),
-                            _esc(r.get("name")),
-                            _esc(r.get("spec")),
-                            _esc(r.get("unit")),
-                            _esc(price_cell),
-                            _esc(labor_cell),
-                            link,
-                        ]
-                    )
-                    + " |"
-                )
+                cells = [
+                    _esc(r.get("code")),
+                    _esc(r.get("name")),
+                    _esc(r.get("spec")),
+                    _esc(r.get("unit")),
+                    _esc(price_cell),
+                    _esc(labor_cell),
+                ]
+                if has_remark:
+                    cells.append(_esc(r.get("remark")))
+                cells.append(_link(r.get("pdf_page")))
+                lines.append("| " + " | ".join(cells) + " |")
             notes = g.get("notes") or []
             figures = g.get("figures") or []
             if notes:
                 lines.append("")
                 lines.append("**【단가정의】**")
+                lines.append("")
+                # N5: 주석 한 항목이 뷰어에서도 한 줄로 분리되도록 목록(- )으로 적는다.
                 for n in notes:
-                    lines.append(n.get("item") or "")
+                    item_txt = _esc_text(n.get("item"))
+                    if item_txt:
+                        lines.append(f"- {item_txt}")
             if figures:
-                if not notes:
-                    lines.append("")
+                lines.append("")
                 for fig in figures:
-                    cap = fig.get("caption") or ""
+                    cap = _esc_text(fig.get("caption"))
                     if cap:
-                        lines.append(f"그림: {cap}")
+                        lines.append(f"- 그림: {cap}")
             lines.append("")
 
         contents[relpath] = "\n".join(lines)
     return contents
 
 
-def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> MdSummary:
+def render_md(
+    result: dict,
+    md_dir: str | Path,
+    pdf_name: str,
+    pdf_path: str | Path | None = None,
+) -> MdSummary:
     md_dir = Path(md_dir)
     summary = MdSummary()
 
@@ -434,7 +518,7 @@ def render_md(result: dict, md_dir: str | Path, pdf_name: str) -> MdSummary:
     # 비교는 이 고정값을 기준으로 하고, 절대 다시 계산하지 않는다(경합 방어 설계 메모 참고).
     md_resolved = md_dir.resolve()
 
-    new_contents = _build_md_contents(result, pdf_name)
+    new_contents = _build_md_contents(result, pdf_name, md_dir, pdf_path)
 
     # 이번 실행의 산출물끼리 대소문자만 다른 경로로 충돌할 수 있다(예: PDF 파싱된
     # field/major 값이 "AB"/"ab" 처럼 대소문자만 다르게 나온 경우). Windows 는 대소문자를

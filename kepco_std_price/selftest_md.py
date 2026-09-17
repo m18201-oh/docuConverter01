@@ -507,6 +507,88 @@ def run_all() -> Check:
             merged_text,
         )
 
+    # ---------- S15: G02i2 F6 md 이스케이프(주석 목록·그림 제목·표 칸) ----------
+    with tempfile.TemporaryDirectory(prefix="g02g_s15_") as tmp:
+        md_dir = Path(tmp) / "out" / "md"
+        r15 = make_result_full()
+        g1 = r15["groups"][0]
+        g1["notes"] = [
+            {"item": "① 수량산출 예는 <사례1> 과 같다.(단가*할증 [적용])"},
+            {"item": "② a_b* 표기와 `코드` 역슬래시\\ 처리."},
+        ]
+        g1["figures"] = [{"caption": "[그림-1] <사례2> 굴진방향*표시", "pdf_page": 10}]
+        g1["header"] = "AB12** <머리> _밑줄_"  # 코치 핫픽스 09-17: 그룹 제목 줄도 같은 기준
+        r15["records"][0]["name"] = "*강조*[대괄호]<태그>"
+        summary15 = render_md(r15, md_dir, PDF_NAME)
+        md_text15 = (md_dir / "토목" / "A_일반.md").read_text(encoding="utf-8")
+        c.check(
+            "S15 주석 <사례1> 이스케이프됨(HTML 로 사라지지 않음)",
+            "\\<사례1\\>" in md_text15 and "<사례1>" not in md_text15,
+            md_text15,
+        )
+        c.check(
+            "S15 주석 강조·대괄호·역슬래시·역따옴표 이스케이프",
+            "단가\\*할증 \\[적용\\]" in md_text15 and "a\\_b\\*" in md_text15 and "\\`코드\\`" in md_text15,
+            md_text15,
+        )
+        c.check(
+            "S15 그림 제목 <사례2> 이스케이프됨",
+            "\\<사례2\\>" in md_text15 and "<사례2>" not in md_text15,
+            md_text15,
+        )
+        c.check(
+            "S15 표 칸(공종명칭) 강조·대괄호·태그 이스케이프",
+            "\\*강조\\*\\[대괄호\\]\\<태그\\>" in md_text15,
+            md_text15,
+        )
+        c.check(
+            "S15 그룹 제목 줄 이스케이프",
+            "## ■ AB12\\*\\* \\<머리\\> \\_밑줄\\_" in md_text15 and "<머리>" not in md_text15,
+            md_text15,
+        )
+        c.check("S15 정상 실행(경고 없음)", not summary15.warnings, str(summary15.warnings))
+
+    # ---------- S16: N4 비고 열·소제목 행, N6 원문 링크(코치 핫픽스 09-17, 리뷰 확인 커버리지 보강) ----------
+    with tempfile.TemporaryDirectory(prefix="g02g_s16_") as tmp:
+        md_dir = Path(tmp) / "out" / "md"
+        r16 = make_result_full()
+        r16["records"][0]["remark"] = "잡석 제외"
+        r16["records"][0]["name_group"] = "A00*"
+        r16["subheaders"] = [{"group_id": "g1", "code_pattern": "A00*", "text": "소제목 글", "pdf_page": 10}]
+        same_drive_pdf = Path(tmp) / "source" / "원문 #1.pdf"
+        summary16 = render_md(r16, md_dir, PDF_NAME, pdf_path=same_drive_pdf)
+        md_a = (md_dir / "토목" / "A_일반.md").read_text(encoding="utf-8")
+        md_b = (md_dir / "토목" / "B_포장.md").read_text(encoding="utf-8")
+        c.check(
+            "S16 비고 레코드가 있는 그룹만 비고 열(8열) · 값 표시",
+            "| 공종코드 | 공종명칭 | 규격 | 단위 | 단가 | 노무비율 | 비고 | 원문 |" in md_a
+            and "잡석 제외" in md_a
+            and "| 비고 |" not in md_b,
+            md_a + "\n----\n" + md_b,
+        )
+        c.check(
+            "S16 소제목 행(코드 패턴 칸·굵은 소제목)이 레코드 앞에 한 번",
+            md_a.count("| A00\\* | **소제목 글** |") == 1
+            and md_a.index("| A00\\* | **소제목 글** |") < md_a.index("| A001 |"),
+            md_a,
+        )
+        c.check(
+            "S16 같은 드라이브 원문 링크: md 위치 기준 상대경로 · 파일명 # 부호화",
+            "(<../../../source/원문 %231.pdf#page=10>)" in md_a,
+            md_a,
+        )
+        c.check("S16 정상 실행(경고 없음)", not summary16.warnings, str(summary16.warnings))
+        tmp_drive = Path(tmp).resolve().drive.upper()
+        other = "D:" if tmp_drive != "D:" else "C:"
+        md_dir2 = Path(tmp) / "out2" / "md"
+        render_md(make_result_full(), md_dir2, PDF_NAME, pdf_path=f"{other}/__kepco_selftest__/a#b.pdf")
+        md_c = (md_dir2 / "토목" / "A_일반.md").read_text(encoding="utf-8")
+        c.check(
+            "S16 다른 드라이브 원문 링크: file:/// URI · # 부호화",
+            f"(<file:///{other}/__kepco_selftest__/a%23b.pdf#page=10>)" in md_c,
+            md_c,
+        )
+
     return c
 
 
