@@ -65,7 +65,9 @@ def main(argv: list[str] | None = None) -> int:
     _write_jsonl(out / "subheaders.jsonl", result["subheaders"])
     _write_jsonl(out / "pages.jsonl", result["pages"])
     try:
-        md_summary = render_md(result, out / "md", pdf_name=Path(args.pdf).name)
+        md_summary = render_md(
+            result, out / "md", pdf_name=Path(args.pdf).name, pdf_path=Path(args.pdf)
+        )
     except MdOutputError as e:
         print(f"오류: {e}", file=sys.stderr)
         return 1
@@ -105,6 +107,11 @@ def main(argv: list[str] | None = None) -> int:
             f"unresolved_inherit={tot.get('unresolved_inherit')} "
             f"parse_mismatch={tot.get('parse_mismatch')} "
             f"inherit_mismatch={tot.get('inherit_mismatch')} "
+            f"notes_missing={tot.get('notes_missing')} "
+            f"notes_duplicate={tot.get('notes_duplicate')} "
+            f"notes_figure_text={tot.get('notes_figure_text')} "
+            f"notes_order_mismatch={tot.get('notes_order_mismatch')} "
+            f"pua_chars={tot.get('pua_chars')} "
             f"pass={tot.get('pass')}",
             flush=True,
         )
