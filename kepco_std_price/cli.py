@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .conservation import check_conservation
 from .extract import extract_pdf
-from .render_md import render_md
+from .render_md import MdOutputError, render_md
 
 
 def _parse_pages(s: str | None) -> tuple[int, int] | None:
@@ -50,7 +50,14 @@ def main(argv: list[str] | None = None) -> int:
     _write_jsonl(out / "groups.jsonl", result["groups"])
     _write_jsonl(out / "subheaders.jsonl", result["subheaders"])
     _write_jsonl(out / "pages.jsonl", result["pages"])
-    render_md(result, out / "md", pdf_name=Path(args.pdf).name)
+    try:
+        md_summary = render_md(result, out / "md", pdf_name=Path(args.pdf).name)
+    except MdOutputError as e:
+        print(f"오류: {e}", file=sys.stderr)
+        return 1
+    for w in md_summary.warnings:
+        print(f"경고: {w}", file=sys.stderr)
+    print(md_summary.line(), flush=True)
     recs = result["records"]
     n_null = sum(1 for r in recs if not r.get("group_id"))
     n_pres = sum(1 for r in recs if r.get("status") == "present")
