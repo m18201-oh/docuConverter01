@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .conservation import check_conservation
-from .extract import extract_pdf
+from .extract import ValidationError, extract_pdf
 from .render_md import MdOutputError, render_md
 
 
@@ -42,8 +42,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    pages = _parse_pages(args.pages)
-    result = extract_pdf(args.pdf, half=args.half, pages=pages)
+    try:
+        pages = _parse_pages(args.pages)
+    except ValueError as e:
+        print(f"오류: --pages 값을 읽을 수 없습니다: {args.pages!r} ({e})", file=sys.stderr)
+        return 2
+
+    # H3·H5: --pages 역전/0/쪽수 초과, --half 형식 오류는 조용히 넘어가지 않고 여기서 멈춘다.
+    try:
+        result = extract_pdf(args.pdf, half=args.half, pages=pages)
+    except ValidationError as e:
+        print(f"오류: {e}", file=sys.stderr)
+        return 2
+
+    for w in result.get("warnings") or []:
+        print(f"경고: {w}", file=sys.stderr)
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     _write_jsonl(out / "records.jsonl", result["records"])
@@ -66,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
         f"records={len(recs)} present={n_pres} abolished={n_ab} group_id_null={n_null}",
         flush=True,
     )
+
+    # H4: 게이트 실패·레코드 0을 조용히 0으로 끝내지 않는다.
+    exit_code = 0
+    if len(recs) == 0:
+        print("오류: 추출된 레코드가 0건입니다.", file=sys.stderr)
+        exit_code = 1
+
     if args.check_conservation:
         report = check_conservation(args.pdf, result, pages=pages)
         (out / "conservation.json").write_text(
@@ -80,11 +101,17 @@ def main(argv: list[str] | None = None) -> int:
             f"lost_spaces={tot.get('lost_spaces')} "
             f"inserted_spaces={tot.get('inserted_spaces')} "
             f"unrecorded_codes={tot.get('unrecorded_codes')} "
+            f"empty_name={tot.get('empty_name')} "
+            f"unresolved_inherit={tot.get('unresolved_inherit')} "
+            f"parse_mismatch={tot.get('parse_mismatch')} "
+            f"inherit_mismatch={tot.get('inherit_mismatch')} "
             f"pass={tot.get('pass')}",
             flush=True,
         )
-    return 0
+        if not tot.get("pass"):
+            exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

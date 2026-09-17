@@ -17,6 +17,8 @@ STAR_RE = re.compile(r"[A-Z]{2}\d{3}\.\d+\*")
 PRICE_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$|^\d+$")
 LABOR_RE = re.compile(r"^\d+(?:\.\d+)?%$")
 HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
+INHERIT_CHARS = set('"\'＂〃“”＇')
+UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton"}
 HEADER_NORM = {
     "공종코드": "code",
     "공종명칭": "name",
@@ -567,6 +569,199 @@ def _line_start_codes(
     return out
 
 
+def _has_inherit_mark(s: str) -> bool:
+    """extract.py 의 _is_inherit() 과 같은 기준(전부 상속 문자)으로 남은 상속 표시를 본다.
+
+    글자 하나라도 포함되면(any) CHK'D· 4"처럼 규격에 흔한 작은따옴표·큰따옴표까지
+    거짓양성으로 잡히므로, 필드 전체가 상속 문자로만 이뤄진 경우만 "안 풀린 상속"으로 본다.
+    """
+    t = re.sub(r"\s+", "", s or "")
+    return bool(t) and all(c in INHERIT_CHARS for c in t)
+
+
+def _has_any_inherit_char(s: str) -> bool:
+    """name 전용: 상속 표시 문자가 한 글자라도 섞여 있으면 "안 풀린 상속"으로 본다.
+
+    review_round1 반증(1)(2): 실명 앞뒤에 상속 문자 하나가 잔존해도(예: '＂1',
+    '직접잔토처리/토사/ 굴착깊이 5m이하＂') _has_inherit_mark()(전부 일치)는 통과시킨다.
+    name 필드는(spec 과 달리) 4권 실측(review_round1 재검)에서 CHK'D· 4" 같은 정당한
+    따옴표 용례가 전혀 없으므로(spec 에만 22건 존재), name 에서는 any 기준을 써도
+    거짓양성이 없다. spec 은 정당한 따옴표 용례가 있어 기존 all 기준을 유지한다.
+    """
+    return any(c in INHERIT_CHARS for c in (s or ""))
+
+
+def _reparse_price(price_raw: str | None) -> int | None:
+    """price_raw 를 독립적으로 재파싱(extract.py 의 함수를 다시 쓰지 않는다)."""
+    if price_raw is None:
+        return None
+    t = str(price_raw).strip()
+    if "폐지" in t:
+        return None
+    digits = t.replace(" ", "").replace(",", "")
+    if digits.isdigit():
+        return int(digits)
+    return None
+
+
+def _reparse_labor(labor_raw: str | None) -> float | None:
+    if labor_raw is None:
+        return None
+    t = str(labor_raw).strip().replace(" ", "")
+    m = LABOR_RE.match(t)
+    return float(t[:-1]) if m else None
+
+
+def _reparse_unit_norm(unit: str | None) -> str | None:
+    if unit is None:
+        return None
+    return UNIT_NORM.get(unit, unit)
+
+
+def _collapse_ws(s: str | None) -> str:
+    """extract.py 의 _collapse() 와 같은 규칙(연속 공백 -> 한 칸, 양끝 자르기)을
+    독립적으로 다시 구현한다(추출 코드의 함수를 그대로 불러 쓰지 않는다)."""
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+_HALF_RANK = {"L": 0, "C": 0, "R": 1}
+
+
+def _order_key(pdf_page: Any, page_half: Any, y0: Any) -> tuple[int, int, float]:
+    """레코드/소제목의 문서상 읽기 순서 키. 쪽(pdf_page) -> 단(L=0,C=0,R=1) -> 세로위치(y0)."""
+    p = int(pdf_page) if pdf_page is not None else 0
+    h = _HALF_RANK.get(page_half or "C", 0)
+    y = float(y0) if y0 is not None else 0.0
+    return (p, h, y)
+
+
+def _inherit_source_gate(records: list[dict], subheaders: list[dict]) -> list[dict[str, Any]]:
+    """review_round1 반증(5)·review_round2 실험 B(gate_false_pass) 에 대한 보강.
+
+    RAW_FIELDS 에 최종 name 이 없어 낱말-보존 체크는 애초에 name 을 보지 않고,
+    unresolved_inherit(전부 상속 문자) 은 임의의 오상속(엉뚱한 선조 이름을 이어받는
+    경우)을 못 잡는다. review_round2 판정(같은 group_id 안에 '존재하는 값'인지만
+    보고 '가장 최근인지'는 안 봄)은 여러 소제목이 섞인 그룹(잔토처리 표의 토사/
+    리핑암/발파암(연암)/발파암(경암) 하위표 등)에서 앞선(틀린) 소제목으로 오상속돼도
+    통과시켰다(실험 B로 재현).
+
+    extract.py 의 상속 로직은 current_sub(가장 최근 소제목 ＊)가 한 번이라도 세워지면
+    그 뒤 상속 레코드는 (그 사이 명시적 name 행이 몇 개 나왔든) 계속 그 소제목을
+    이어받고, current_sub 가 전혀 없을 때만 직전 명시적 name(prev_name)을 이어받는다.
+    이 게이트는 그 우선순위를 그대로 재현해 '이 레코드보다 앞선 것 중 가장 최근인'
+    후보 단 하나만 정답으로 인정한다(순서 키는 subheaders.jsonl 의 page_half·y0,
+    records.jsonl 의 page_half·bbox[1]로 추출 코드와 별도로 재구성).
+    """
+    from collections import defaultdict
+
+    subs_by_group: dict[Any, list[tuple[tuple[int, int, float], str]]] = defaultdict(list)
+    for sub in subheaders:
+        key = _order_key(sub.get("pdf_page"), sub.get("page_half"), sub.get("y0"))
+        subs_by_group[sub.get("group_id")].append((key, (sub.get("text") or "").strip()))
+    for gid in subs_by_group:
+        subs_by_group[gid].sort(key=lambda t: t[0])
+
+    names_by_group: dict[Any, list[tuple[tuple[int, int, float], str]]] = defaultdict(list)
+    for rec in records:
+        if rec.get("name_inherited"):
+            continue
+        bbox = rec.get("bbox") or [0, 0, 0, 0]
+        y0 = bbox[1] if len(bbox) == 4 else None
+        key = _order_key(rec.get("pdf_page"), rec.get("page_half"), y0)
+        names_by_group[rec.get("group_id")].append((key, (rec.get("name") or "").strip()))
+    for gid in names_by_group:
+        names_by_group[gid].sort(key=lambda t: t[0])
+
+    out: list[dict[str, Any]] = []
+    for rec in records:
+        if not rec.get("name_inherited"):
+            continue
+        gid = rec.get("group_id")
+        bbox = rec.get("bbox") or [0, 0, 0, 0]
+        y0 = bbox[1] if len(bbox) == 4 else None
+        key = _order_key(rec.get("pdf_page"), rec.get("page_half"), y0)
+        name = (rec.get("name") or "").strip()
+        item = {
+            "code": rec.get("code"),
+            "half": rec.get("half"),
+            "pdf_page": rec.get("pdf_page"),
+            "group_id": gid,
+            "name": rec.get("name"),
+        }
+        subs_before = [t for k, t in subs_by_group.get(gid, []) if k < key]
+        if subs_before:
+            expected = subs_before[-1]
+            if name != expected:
+                out.append(dict(item, candidates=[expected], source="subheader"))
+            continue
+        names_before = [t for k, t in names_by_group.get(gid, []) if k < key]
+        if names_before:
+            expected = names_before[-1]
+            if name != expected:
+                out.append(dict(item, candidates=[expected], source="prev_name"))
+        else:
+            out.append(dict(item, candidates=[], source="none"))
+    return out
+
+
+def _field_gates(
+    records: list[dict], subheaders: list[dict] | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """H2: 최종 필드 불변식. 원문 낱말(raw)이 아니라 name·spec·price·labor_ratio·unit_norm
+    최종 값 자체가 맞는지를 본다(추출 코드의 파싱 함수를 재사용하지 않고 독립적으로 다시 판정).
+
+    review_round2 실험 A(gate_false_pass): 비상속(name_inherited=false) 리프 레코드는
+    price/labor_ratio/unit_norm 만 재파싱하던 기존 parse_mismatch 로는 name 이 통째로
+    엉뚱한 문자열로 바뀌어도(빈칸도 상속기호도 아니면) 전혀 안 잡혔다. extract.py 는
+    비상속 행의 name 을 name = _collapse(name_raw) 로만 만드므로, 그 관계를
+    name_raw -> name 재계산으로 독립 검증한다(상속 행의 name 은 name_raw 에서 오지
+    않으므로 대상이 아니다 — 그쪽은 _inherit_source_gate 가 맡는다). spec 은 상속이
+    없어 모든 레코드에 같은 방식으로 적용한다.
+    """
+    empty_name: list[dict[str, Any]] = []
+    unresolved_inherit: list[dict[str, Any]] = []
+    parse_mismatch: list[dict[str, Any]] = []
+    for rec in records:
+        status = (rec.get("status") or "").strip()
+        item = {"code": rec.get("code"), "half": rec.get("half"), "pdf_page": rec.get("pdf_page")}
+        if status in ("present", "abolished") and not (rec.get("name") or "").strip():
+            empty_name.append(dict(item, name_raw=rec.get("name_raw")))
+        if _has_any_inherit_char(rec.get("name") or "") or _has_inherit_mark(rec.get("spec") or ""):
+            unresolved_inherit.append(dict(item, name=rec.get("name"), spec=rec.get("spec")))
+        mism = {}
+        exp_price = _reparse_price(rec.get("price_raw"))
+        if exp_price != rec.get("price"):
+            mism["price"] = {"expected": exp_price, "actual": rec.get("price"), "raw": rec.get("price_raw")}
+        exp_labor = _reparse_labor(rec.get("labor_raw"))
+        if exp_labor != rec.get("labor_ratio"):
+            mism["labor_ratio"] = {
+                "expected": exp_labor,
+                "actual": rec.get("labor_ratio"),
+                "raw": rec.get("labor_raw"),
+            }
+        exp_unit = _reparse_unit_norm(rec.get("unit"))
+        if exp_unit != rec.get("unit_norm"):
+            mism["unit_norm"] = {"expected": exp_unit, "actual": rec.get("unit_norm"), "unit": rec.get("unit")}
+        if not rec.get("name_inherited"):
+            exp_name = _collapse_ws(rec.get("name_raw"))
+            if exp_name != (rec.get("name") or ""):
+                mism["name"] = {"expected": exp_name, "actual": rec.get("name"), "raw": rec.get("name_raw")}
+        spec_raw = rec.get("spec_raw")
+        if spec_raw is not None:
+            spec_raw_s = str(spec_raw)
+            exp_spec = _collapse_ws(spec_raw_s) if spec_raw_s.strip() else spec_raw_s.strip()
+            if exp_spec != (rec.get("spec") or ""):
+                mism["spec"] = {"expected": exp_spec, "actual": rec.get("spec"), "raw": rec.get("spec_raw")}
+        if mism:
+            parse_mismatch.append(dict(item, mismatch=mism))
+    return {
+        "empty_name": empty_name,
+        "unresolved_inherit": unresolved_inherit,
+        "parse_mismatch": parse_mismatch,
+        "inherit_mismatch": _inherit_source_gate(records, subheaders or []),
+    }
+
+
 def check_conservation(
     pdf_path: str | Path,
     result: dict[str, Any],
@@ -816,6 +1011,15 @@ def check_conservation(
         tot_unrec += len(unrecorded)
 
     doc.close()
+
+    # H2: 원문 낱말 -> raw 필드뿐 아니라 최종 필드(name·spec·price·labor_ratio·unit_norm)
+    # 자체의 불변식도 게이트에 넣는다.
+    gates = _field_gates(result.get("records") or [], result.get("subheaders") or [])
+    n_empty_name = len(gates["empty_name"])
+    n_unresolved_inherit = len(gates["unresolved_inherit"])
+    n_parse_mismatch = len(gates["parse_mismatch"])
+    n_inherit_mismatch = len(gates["inherit_mismatch"])
+
     return {
         "half": result.get("half"),
         "pages": page_reports,
@@ -824,6 +1028,10 @@ def check_conservation(
         "inserted_spaces": inserted_all,
         "unrecorded_codes": unrec_all,
         "digit_only": digit_only_all,
+        "empty_name": gates["empty_name"],
+        "unresolved_inherit": gates["unresolved_inherit"],
+        "parse_mismatch": gates["parse_mismatch"],
+        "inherit_mismatch": gates["inherit_mismatch"],
         "totals": {
             "body_words": tot_body,
             "assigned": tot_assigned,
@@ -834,11 +1042,19 @@ def check_conservation(
             "inserted_spaces": tot_ins,
             "unrecorded_codes": tot_unrec,
             "digit_only": len(digit_only_all),
+            "empty_name": n_empty_name,
+            "unresolved_inherit": n_unresolved_inherit,
+            "parse_mismatch": n_parse_mismatch,
+            "inherit_mismatch": n_inherit_mismatch,
             "pass": tot_missing == 0
             and tot_dup == 0
             and tot_split == 0
             and tot_lost == 0
             and tot_ins == 0
-            and tot_unrec == 0,
+            and tot_unrec == 0
+            and n_empty_name == 0
+            and n_unresolved_inherit == 0
+            and n_parse_mismatch == 0
+            and n_inherit_mismatch == 0,
         },
     }

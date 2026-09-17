@@ -38,6 +38,48 @@ BANNER_RE = re.compile(r"대분류\s*([A-Z])(?:\s*[,，]\s*([A-Z]))?\s*(.*)$")
 BANNER_TRAIL_RE = re.compile(r"[·.…⋯]+.*$")
 HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
 _EV_ORDER = {"banner": 0, "group": 1, "table": 2, "notes": 3}
+HALF_FMT_RE = re.compile(r"^20\d{2}H[12]$")
+
+
+class ValidationError(ValueError):
+    """--half·--pages 같은 입력값이 잘못돼 추출을 시작할 수 없을 때(H3·H5)."""
+
+
+def _validate_half(half: str, pdf_path: str | Path) -> list[str]:
+    """--half 형식(^20\\d{2}H[12]$)을 검사하고, PDF 파일명에서 반기를 읽을 수 있으면 대조한다.
+
+    형식이 틀리면 즉시 멈춘다(예외). 파일명과 다르면 막지 않고 경고만 돌려준다.
+    """
+    if not HALF_FMT_RE.match(half or ""):
+        raise ValidationError(
+            f"--half 형식이 올바르지 않습니다(예: 2025H2): {half!r}"
+        )
+    name = Path(pdf_path).name
+    ym = re.search(r"(20\d{2})", name)
+    half_word = "H1" if "상반기" in name else ("H2" if "하반기" in name else None)
+    warnings: list[str] = []
+    if ym and half_word:
+        expected = f"{ym.group(1)}{half_word}"
+        if expected != half:
+            warnings.append(
+                f"--half={half} 이(가) PDF 파일명에서 읽은 반기({expected})와 다릅니다: {name}"
+            )
+    return warnings
+
+
+def _validate_pages(pages: tuple[int, int] | None, page_count: int) -> None:
+    """--pages 의 역전(8-3)·0 이하·시작쪽이 PDF 쪽수를 넘는 경우를 조용히 넘어가지 않고 멈춘다."""
+    if pages is None:
+        return
+    start, end = pages
+    if start < 1 or end < 1:
+        raise ValidationError(f"--pages 값은 1 이상이어야 합니다: {start}-{end}")
+    if start > end:
+        raise ValidationError(f"--pages 시작쪽이 끝쪽보다 큽니다(역전): {start}-{end}")
+    if start > page_count:
+        raise ValidationError(
+            f"--pages 시작쪽 {start} 이(가) PDF 총 쪽수 {page_count}쪽을 넘습니다"
+        )
 
 
 @dataclass
@@ -939,8 +981,14 @@ def extract_pdf(
     pages: tuple[int, int] | None = None,
 ) -> dict:
     pdf_path = Path(pdf_path)
-    sha = _sha256(pdf_path)
     doc = fitz.open(pdf_path)
+    try:
+        half_warnings = _validate_half(half, pdf_path)
+        _validate_pages(pages, doc.page_count)
+    except Exception:
+        doc.close()
+        raise
+    sha = _sha256(pdf_path)
     field_starts = _scan_fields(doc)
     start, end = (1, doc.page_count) if pages is None else pages
     start = max(1, start)
@@ -950,12 +998,17 @@ def extract_pdf(
     groups: list[dict] = []
     subheaders: list[dict] = []
     pages_out: list[dict] = []
+    warnings: list[str] = list(half_warnings)
 
     last_group: dict | None = None
     last_colmap: dict[str, tuple[float, float]] | None = None
     last_major = ""
     last_major_name = ""
     group_seq = 0
+    # H1: 표가 쪽·단을 넘어 이어질 때도 직전 소제목(＊)·직전 명칭을 이어받는다.
+    # last_group·last_colmap 과 같은 원리로, 새 ■ 그룹이 시작될 때만 끊는다(new_group 참고).
+    last_sub: tuple[str, str] | None = None
+    last_prev_name = ""
 
     # --pages 중간부터여도 앞쪽 배너를 읽어 대분류를 이어받는다
     if start > 1:
@@ -1061,8 +1114,11 @@ def extract_pdf(
             half_started = False
 
             def new_group(header_span: Span) -> dict:
-                nonlocal group_seq, last_group, last_major
+                nonlocal group_seq, last_group, last_major, last_sub, last_prev_name
                 group_seq += 1
+                # 새 ■ 그룹은 새 주제이므로 직전 그룹의 소제목·명칭 이어받기를 끊는다.
+                last_sub = None
+                last_prev_name = ""
                 raw = _line_text_at(spans, header_span.yc, hx0, hx1, tol=10)
                 if raw.startswith("■") and len(raw) > 1 and raw[1] != " ":
                     raw = "■ " + raw[1:]
@@ -1291,7 +1347,9 @@ def extract_pdf(
                     centers = [sp.yc for _, sp in items_sorted]
                     bands = _row_bands(centers, hlines, table_x0, table_x1, table_top, table_bottom)
 
-                    current_sub = None  # (pattern, text)
+                    # H1: 이 표 뭉치가 같은 그룹 안에서 쪽·단만 넘어 이어지는 것이면
+                    # 직전 뭉치의 소제목·명칭을 이어받는다(그룹이 바뀌면 new_group 이 끊음).
+                    current_sub = last_sub  # (pattern, text)
                     fx = table_x0
                     tx = table_x1
                     code_col = _col(colmap, "code", (fx, fx + 80))
@@ -1303,7 +1361,7 @@ def extract_pdf(
                     remark_col = colmap.get("remark")
                     has_remark = remark_col is not None
 
-                    prev_name = ""
+                    prev_name = last_prev_name
                     for (kind, sp), (y0, y1) in zip(items_sorted, bands):
                         if kind == "star":
                             pat = sp.text.strip()
@@ -1314,6 +1372,8 @@ def extract_pdf(
                                 {
                                     "half": half,
                                     "pdf_page": pno,
+                                    "page_half": ph,
+                                    "y0": round(y0, 1),
                                     "code_pattern": pat,
                                     "text": txt,
                                     "group_id": grp["group_id"] if grp else None,
@@ -1395,10 +1455,19 @@ def extract_pdf(
                             if not abolished_at:
                                 abolished_at = labor_tok
 
-                        inherited = _is_inherit(name_raw)
+                        # 명칭 칸이 상속 표시(＂ 등)이거나, 원문에 상속 표시조차 없이
+                        # 통째로 비어 있는 경우(표 인쇄 시 표시를 누락한 실제 사례,
+                        # 예: 2024H1 p68 NA109.22202)도 직전 명칭을 이어받는다.
+                        name_blank = not re.sub(r"\s+", "", name_raw or "")
+                        inherited = _is_inherit(name_raw) or name_blank
                         name_group = current_sub[0] if current_sub else None
                         if inherited:
                             name = current_sub[1] if current_sub else prev_name
+                            if not name:
+                                warnings.append(
+                                    f"명칭 상속 실패(이어받을 명칭 없음): code={code} "
+                                    f"half={half} pdf_page={pno} name_raw={name_raw!r}"
+                                )
                         else:
                             name = _collapse(name_raw)
                             prev_name = name
@@ -1460,6 +1529,11 @@ def extract_pdf(
                             grp["record_count"] = grp.get("record_count", 0) + 1
                         records.append(rec)
 
+                    # H1: 이 표 뭉치가 끝나며 도달한 소제목·명칭 상태를 다음 뭉치(쪽·단이
+                    # 바뀌어도)로 넘긴다. 그룹이 바뀌면 new_group() 이 다시 끊는다.
+                    last_sub = current_sub
+                    last_prev_name = prev_name
+
                 elif etype == "notes":
                     grp = current_group or last_group
                     attach_notes_from(ey - 2, next_y, grp)
@@ -1488,4 +1562,5 @@ def extract_pdf(
         "pages": pages_out,
         "sha256": sha,
         "half": half,
+        "warnings": warnings,
     }
