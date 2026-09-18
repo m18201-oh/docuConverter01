@@ -122,19 +122,26 @@ def _snapshot(md_dir: Path) -> dict[str, str]:
 
 class Check:
     def __init__(self):
-        self.results: list[tuple[str, bool, str]] = []
+        self.results: list[tuple[str, bool | None, str]] = []
 
     def check(self, name: str, cond: bool, detail: str = ""):
         self.results.append((name, cond, detail))
 
+    def skip(self, name: str, detail: str = ""):
+        self.results.append((name, None, detail))
+
     def all_pass(self) -> bool:
-        return all(ok for _, ok, _ in self.results)
+        return all(ok is not False for _, ok, _ in self.results)
 
     def report(self) -> str:
         lines = []
         for name, ok, detail in self.results:
-            status = "PASS" if ok else "FAIL"
-            suffix = f" - {detail}" if (detail and not ok) else ""
+            if ok is None:
+                status = "SKIP"
+                suffix = f" - {detail}" if detail else ""
+            else:
+                status = "PASS" if ok else "FAIL"
+                suffix = f" - {detail}" if (detail and not ok) else ""
             lines.append(f"{status} {name}{suffix}")
         return "\n".join(lines)
 
@@ -579,15 +586,21 @@ def run_all() -> Check:
         )
         c.check("S16 정상 실행(경고 없음)", not summary16.warnings, str(summary16.warnings))
         tmp_drive = Path(tmp).resolve().drive.upper()
-        other = "D:" if tmp_drive != "D:" else "C:"
-        md_dir2 = Path(tmp) / "out2" / "md"
-        render_md(make_result_full(), md_dir2, PDF_NAME, pdf_path=f"{other}/__kepco_selftest__/a#b.pdf")
-        md_c = (md_dir2 / "토목" / "A_일반.md").read_text(encoding="utf-8")
-        c.check(
-            "S16 다른 드라이브 원문 링크: file:/// URI · # 부호화",
-            f"(<file:///{other}/__kepco_selftest__/a%23b.pdf#page=10>)" in md_c,
-            md_c,
-        )
+        if not tmp_drive:
+            c.skip(
+                "S16 다른 드라이브 원문 링크: file:/// URI · # 부호화",
+                "드라이브 없는 플랫폼 (Path.drive empty)",
+            )
+        else:
+            other = "D:" if tmp_drive != "D:" else "C:"
+            md_dir2 = Path(tmp) / "out2" / "md"
+            render_md(make_result_full(), md_dir2, PDF_NAME, pdf_path=f"{other}/__kepco_selftest__/a#b.pdf")
+            md_c = (md_dir2 / "토목" / "A_일반.md").read_text(encoding="utf-8")
+            c.check(
+                "S16 다른 드라이브 원문 링크: file:/// URI · # 부호화",
+                f"(<file:///{other}/__kepco_selftest__/a%23b.pdf#page=10>)" in md_c,
+                md_c,
+            )
 
     # K3③: conservation.py 와 extract.py 의 PUA 숫자 대응표 키 집합이 같아야 한다.
     from .conservation import _PUA_DIGIT_MAP as _GATE_PUA

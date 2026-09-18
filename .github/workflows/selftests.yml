@@ -1,0 +1,35 @@
+name: selftests
+
+on:
+  pull_request:
+    branches: [frontend]
+  push:
+    branches: [frontend]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  selftests:
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra hwp
+      - run: uv run python -m kepco_std_price.selftest_md
+      - run: uv run --extra hwp python -m kepco_std_price.selftest_hwp
