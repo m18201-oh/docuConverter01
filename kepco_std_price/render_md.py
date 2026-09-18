@@ -365,7 +365,7 @@ def _build_md_contents(
     sha = result.get("sha256") or ""
     pages = result.get("pages") or []
     layout = pages[0]["layout"] if pages else ""
-    page_nums = [p["pdf_page"] for p in pages]
+    page_nums = [p["pdf_page"] for p in pages if isinstance(p.get("pdf_page"), int)]
     page_range = f"{min(page_nums)}-{max(page_nums)}" if page_nums else ""
     pdf_rel = _pdf_link_target(md_dir, pdf_path, pdf_name)
 
@@ -373,6 +373,12 @@ def _build_md_contents(
         if pdf_page is None:
             return ""
         return f"[p.{pdf_page}](<{pdf_rel}#page={pdf_page}>)"
+
+    def _source_ref(obj: dict) -> str:
+        anchor = obj.get("hwp_anchor")
+        if isinstance(anchor, dict) and anchor.get("table_index") is not None:
+            return f"표{anchor['table_index']} 행{anchor.get('row')}"
+        return _link(obj.get("pdf_page"))
 
     gmap = {g["group_id"]: g for g in groups}
     by_key: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
@@ -456,7 +462,7 @@ def _build_md_contents(
                     ]
                     if has_remark:
                         sub_cells.append("")
-                    sub_cells.append(_link(s.get("pdf_page")))
+                    sub_cells.append(_source_ref(s))
                     lines.append("| " + " | ".join(sub_cells) + " |")
                 if r.get("status") == "abolished":
                     price_cell = r.get("price_raw") or "폐지"
@@ -474,7 +480,7 @@ def _build_md_contents(
                 ]
                 if has_remark:
                     cells.append(_esc(r.get("remark")))
-                cells.append(_link(r.get("pdf_page")))
+                cells.append(_source_ref(r))
                 lines.append("| " + " | ".join(cells) + " |")
             notes = g.get("notes") or []
             figures = g.get("figures") or []

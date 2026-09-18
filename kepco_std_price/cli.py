@@ -31,9 +31,11 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 def main(argv: list[str] | None = None) -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(prog="kepco_std_price")
-    ap.add_argument("--pdf", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--pdf", default=None)
+    src.add_argument("--hwp", default=None)
     ap.add_argument("--half", required=True, help="예: 2025H2")
-    ap.add_argument("--pages", default=None, help="예: 46-95 (없으면 전체)")
+    ap.add_argument("--pages", default=None, help="예: 46-95 (없으면 전체, --hwp 와는 함께 쓰지 않음)")
     ap.add_argument("--out", required=True)
     ap.add_argument(
         "--check-conservation",
@@ -42,6 +44,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    if args.hwp and args.pages:
+        print("오류: --hwp 와 --pages 는 함께 쓸 수 없습니다.", file=sys.stderr)
+        return 2
+
     try:
         pages = _parse_pages(args.pages)
     except ValueError as e:
@@ -49,8 +55,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # H3·H5: --pages 역전/0/쪽수 초과, --half 형식 오류는 조용히 넘어가지 않고 여기서 멈춘다.
+    source_path = Path(args.hwp) if args.hwp else Path(args.pdf)
     try:
-        result = extract_pdf(args.pdf, half=args.half, pages=pages)
+        if args.hwp:
+            try:
+                from hwp5.xmlmodel import Hwp5File  # noqa: F401
+            except ImportError:
+                print("uv sync --extra hwp 필요", file=sys.stderr)
+                return 2
+            from .extract_hwp import extract_hwp
+
+            result = extract_hwp(args.hwp, half=args.half)
+        else:
+            result = extract_pdf(args.pdf, half=args.half, pages=pages)
     except ValidationError as e:
         print(f"오류: {e}", file=sys.stderr)
         return 2
@@ -66,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_jsonl(out / "pages.jsonl", result["pages"])
     try:
         md_summary = render_md(
-            result, out / "md", pdf_name=Path(args.pdf).name, pdf_path=Path(args.pdf)
+            result, out / "md", pdf_name=source_path.name, pdf_path=source_path
         )
     except MdOutputError as e:
         print(f"오류: {e}", file=sys.stderr)
@@ -91,7 +108,12 @@ def main(argv: list[str] | None = None) -> int:
 
     table_cache = result.pop("_table_cache", None)
     if args.check_conservation:
-        report = check_conservation(args.pdf, result, pages=pages, table_cache=table_cache)
+        if args.hwp:
+            from .conservation_hwp import check_conservation as check_conservation_hwp
+
+            report = check_conservation_hwp(args.hwp, result)
+        else:
+            report = check_conservation(args.pdf, result, pages=pages, table_cache=table_cache)
         (out / "conservation.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
