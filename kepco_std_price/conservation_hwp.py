@@ -13,30 +13,25 @@ from typing import Any
 
 from lxml import etree
 
-CODE_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
-STAR_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d+\*")
-PRICE_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$|^\d+$")
-LABOR_RE = re.compile(r"^\d+(?:\.\d+)?%$")
-INHERIT_CHARS = set("\"'＂〃“”＇")
-HEADER_MAP = {
-    "공종코드": "code",
-    "공종명칭": "name",
-    "공종명": "name",
-    "규격": "spec",
-    "단위": "unit",
-    "단가": "price",
-    "노무비율": "labor",
-    "비고": "remark",
-}
-HEADER_NORM = {k.replace(" ", ""): v for k, v in HEADER_MAP.items()}
-UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton"}
-CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳ⓛ"
-FIGURE_CAPTION_PREFIXES = ("[그림", "[표준도]")
+from .spec import (
+    BANNER_RE,
+    CIRCLED,
+    CODE_FIND,
+    DIST_RANGE_RE,
+    FIGURE_CAPTION_PREFIXES,
+    HALF_LABOR_RE,
+    HEADER_MAP,
+    HEADER_NORM,
+    INHERIT_CHARS,
+    LABOR_RE,
+    PRICE_RE,
+    STAR_FIND,
+    UNIT_NORM,
+)
+
 _STOP = ("TableControl", "GShapeObjectControl")
 _PUA_RE = re.compile(r"[\ue000-\uf8ff]")
-HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
 FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야(?:자체표준시장단가)?")
-BANNER_RE = re.compile(r"대분류\s*([A-Z])")
 
 
 def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
@@ -202,6 +197,15 @@ def _is_diagram_table(rows: list[list[dict]]) -> bool:
         return True
     if "자체단가의적용방법" in compact:
         return True
+    has_price_comma = bool(re.search(r"\d{1,3}(?:,\d{3})+", blob))
+    has_code = bool(CODE_FIND.search(blob))
+    has_dist = bool(DIST_RANGE_RE.search(blob) or DIST_RANGE_RE.search(compact))
+    if has_code and has_dist and not has_price_comma:
+        return True
+    if "품셈으로산출" in compact and not has_price_comma and (
+        has_code or has_dist or any(q in compact for q in ("양호", "보통", "불량"))
+    ):
+        return True
     return False
 
 
@@ -334,6 +338,7 @@ def _field_gates(records: list[dict], subheaders: list[dict]) -> dict[str, list[
     empty_name: list[dict[str, Any]] = []
     unresolved_inherit: list[dict[str, Any]] = []
     parse_mismatch: list[dict[str, Any]] = []
+    price_unparsed: list[dict[str, Any]] = []
     for rec in records:
         status = (rec.get("status") or "").strip()
         item = {"code": rec.get("code"), "half": rec.get("half"), "hwp_anchor": rec.get("hwp_anchor")}
@@ -367,6 +372,10 @@ def _field_gates(records: list[dict], subheaders: list[dict]) -> dict[str, list[
                 mism["spec"] = {"expected": exp_spec, "actual": rec.get("spec"), "raw": rec.get("spec_raw")}
         if mism:
             parse_mismatch.append(dict(item, mismatch=mism))
+        if status == "present" and rec.get("price") is None:
+            raw = (rec.get("price_raw") or "").strip()
+            if raw and "폐지" not in raw:
+                price_unparsed.append(dict(item, price_raw=raw))
 
     inherit_mismatch: list[dict[str, Any]] = []
     sub_by_group: dict[str, list[dict]] = {}
@@ -406,6 +415,7 @@ def _field_gates(records: list[dict], subheaders: list[dict]) -> dict[str, list[
         "unresolved_inherit": unresolved_inherit,
         "parse_mismatch": parse_mismatch,
         "inherit_mismatch": inherit_mismatch,
+        "price_unparsed": price_unparsed,
     }
 
 
@@ -745,6 +755,10 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
     n_nd = len(notes_duplicate)
     n_no = len(notes_order_mismatch)
     n_pua = len(pua_hits)
+    n_price_unparsed = len(gates.get("price_unparsed") or [])
+    table_shape_warnings = [
+        {"detail": w} for w in (result.get("warnings") or []) if str(w).startswith("table_shape")
+    ]
 
     tot_missing = len(missing)
     tot_dup = len(duplicate)
@@ -765,6 +779,9 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
         "unresolved_inherit": gates["unresolved_inherit"],
         "parse_mismatch": gates["parse_mismatch"],
         "inherit_mismatch": gates["inherit_mismatch"],
+        "price_unparsed": gates.get("price_unparsed") or [],
+        "table_shape_warnings": table_shape_warnings,
+        "field_x_order": [],
         "notes_missing": notes_missing,
         "notes_duplicate": notes_duplicate,
         "notes_figure_text": notes_figure_text,
@@ -792,6 +809,9 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
             "notes_order_mismatch": n_no,
             "pua_chars": n_pua,
             "gate_page_errors": 0,
+            "price_unparsed": n_price_unparsed,
+            "field_x_order": 0,
+            "table_shape_warnings": len(table_shape_warnings),
             "pass": tot_missing == 0
             and tot_dup == 0
             and tot_split == 0

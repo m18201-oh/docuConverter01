@@ -599,6 +599,40 @@ def run_all() -> Check:
         f"extract={sorted(_EXTRACT_PUA)} gate={sorted(_GATE_PUA)}",
     )
 
+    # L8: 없는 파일·빈 파일·글자층 0 PDF → 한 줄 오류, 종료 코드 2
+    from .cli import main as cli_main
+    from .extract import ValidationError, extract_pdf
+    import pymupdf as fitz
+
+    with tempfile.TemporaryDirectory(prefix="g02j_l8_") as tmp:
+        tmp_p = Path(tmp)
+        missing = tmp_p / "no_such.pdf"
+        try:
+            extract_pdf(missing, half="2025H2")
+            c.check("L8 missing file raises", False, "no exception")
+        except ValidationError as e:
+            c.check("L8 missing file message", "없습니다" in str(e), str(e))
+        empty = tmp_p / "empty.pdf"
+        empty.write_bytes(b"")
+        try:
+            extract_pdf(empty, half="2025H2")
+            c.check("L8 empty file raises", False, "no exception")
+        except ValidationError as e:
+            c.check("L8 empty file message", "비어" in str(e) or "손상" in str(e) or "글자층" in str(e), str(e))
+        blank_pdf = tmp_p / "blank.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.save(blank_pdf)
+        doc.close()
+        try:
+            extract_pdf(blank_pdf, half="2025H2")
+            c.check("L8 no-text PDF raises", False, "no exception")
+        except ValidationError as e:
+            c.check("L8 no-text PDF message", "글자층" in str(e), str(e))
+        out_dir = tmp_p / "out"
+        code = cli_main(["--pdf", str(missing), "--half", "2025H2", "--out", str(out_dir)])
+        c.check("L8 CLI missing exit 2", code == 2, str(code))
+
     return c
 
 

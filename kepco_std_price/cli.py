@@ -135,10 +135,19 @@ def main(argv: list[str] | None = None) -> int:
             f"notes_figure_text={tot.get('notes_figure_text')} "
             f"notes_order_mismatch={tot.get('notes_order_mismatch')} "
             f"pua_chars={tot.get('pua_chars')} "
+            f"price_unparsed={tot.get('price_unparsed')} "
+            f"table_shape_warnings={tot.get('table_shape_warnings')} "
+            f"field_x_order={tot.get('field_x_order')} "
             f"gate_page_errors={tot.get('gate_page_errors')} "
             f"pass={tot.get('pass')}",
             flush=True,
         )
+        pu = report.get("price_unparsed") or []
+        if pu:
+            print("price_unparsed_list=" + json.dumps(pu, ensure_ascii=False), flush=True)
+        tw = report.get("table_shape_warnings") or []
+        if tw:
+            print("table_shape_warnings_list=" + json.dumps(tw, ensure_ascii=False), flush=True)
         if not tot.get("pass"):
             exit_code = 1
     return exit_code

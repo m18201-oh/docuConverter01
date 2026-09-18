@@ -294,6 +294,103 @@ def run_all() -> Check:
         c.check("H27 md layout hwp", "layout: hwp" in text)
         c.check("H28 md no crash", summary is not None)
 
+    from .spec import BANNER_RE, HALF_LABOR_RE
+
+    c.check("L1 U+2019 ’25상", bool(HALF_LABOR_RE.match("\u201925상")))
+    c.check("L1 U+FF07 ＇25상", bool(HALF_LABOR_RE.match("\uff0725상")))
+    c.check("L1 U+0027 '25상", bool(HALF_LABOR_RE.match("'25상")))
+
+    m3 = BANNER_RE.search("대분류 Q, R, S 기타공사")
+    c.check(
+        "L6 banner 3 letters",
+        bool(m3) and m3.group(1) == "Q" and "기타공사" in (m3.group(2) or ""),
+        str(m3.groups() if m3 else None),
+    )
+
+    rec_u2019 = _row(1, [(0, "AE230.30001"), (1, "철거"), (2, "-"), (3, "set"), (4, "폐기"), (5, "\u201925상")])
+    rec_uff07 = _row(1, [(0, "AE230.30002"), (1, "철거"), (2, "-"), (3, "set"), (4, "폐기"), (5, "\uff0725상")])
+    rec_u0027 = _row(1, [(0, "AE230.30003"), (1, "철거"), (2, "-"), (3, "set"), (4, "폐기"), (5, "'25상")])
+    rec_dec = _row(1, [(0, "AE230.30004"), (1, "소수단가"), (2, "-"), (3, "m"), (4, "1,234.5"), (5, "10.00%")])
+    header_lat = _row(
+        0,
+        [(0, "공종코드"), (1, "공종명칭"), (2, "규격"), (3, "단위"), (4, "단가"), (5, "노무비율")],
+    )
+    banner_qrs = (
+        "<Paragraph><LineSeg><TableControl chid='tbl '>"
+        "<TableBody rows='1' cols='2'><TableRow>"
+        + _cell(0, 0, "대분류 Q, R, S")
+        + _cell(1, 0, "기타공사")
+        + "</TableRow></TableBody></TableControl></LineSeg></Paragraph>"
+    )
+    diagram = (
+        "<Paragraph><LineSeg><TableControl chid='tbl '>"
+        "<TableBody rows='2' cols='3'>"
+        "<TableRow>"
+        + _cell(0, 0, "ND109.11111 0-150m이내, 양호")
+        + _cell(1, 0, "ND109.11112 0-150m이내, 보통")
+        + _cell(2, 0, "ND109.11113 0-150m이내, 불량")
+        + "</TableRow>"
+        "<TableRow>"
+        + _cell(0, 1, "품셈으로 산출")
+        + _cell(1, 1, "")
+        + _cell(2, 1, "")
+        + "</TableRow></TableBody></TableControl></LineSeg></Paragraph>"
+    )
+    xml_lat = f"""<?xml version="1.0" encoding="utf-8"?>
+<HwpDoc version="5.1.1.0">
+  <BodyText>
+    <SectionDef section-id="0">
+      <PageDef width="59528" height="84188" orientation="portrait"/>
+      <ColumnSet>
+        {_text_para("토목분야 자체 표준시장단가")}
+        {banner_qrs}
+        {_text_para("■ AE23* 주형보")}
+        {_table([header_lat, rec_u2019])}
+        {_table([header_lat, rec_uff07])}
+        {_table([header_lat, rec_u0027])}
+        {_table([header_lat, rec_dec])}
+        {_text_para("【단가정의】")}
+        {_text_para("① 본 단가 적용을 위한 수량산출 예는 아래와 같다.")}
+        {_text_para("굴진방향→")}
+        {diagram}
+      </ColumnSet>
+    </SectionDef>
+  </BodyText>
+</HwpDoc>
+"""
+    root_lat = etree.fromstring(xml_lat.encode("utf-8"))
+    res_lat = extract_from_root(root_lat, "2026H1", sha="beef")
+    recs_lat = {r["code"]: r for r in res_lat["records"]}
+    for code, mark in (
+        ("AE230.30001", "U+2019"),
+        ("AE230.30002", "U+FF07"),
+        ("AE230.30003", "U+0027"),
+    ):
+        rlat = recs_lat.get(code)
+        c.check(
+            f"L1 extract abolished {mark}",
+            bool(rlat) and rlat.get("status") == "abolished" and rlat.get("price") is None,
+            str(rlat),
+        )
+    rdec = recs_lat.get("AE230.30004")
+    c.check(
+        "L2 unparsed price kept",
+        bool(rdec) and rdec.get("price") is None and "1,234.5" in str(rdec.get("price_raw") or ""),
+        str(rdec),
+    )
+    g_lat = res_lat["groups"][0] if res_lat["groups"] else {}
+    c.check(
+        "L6 major Q 기타공사",
+        g_lat.get("major") == "Q" and g_lat.get("major_name") == "기타공사",
+        str(g_lat),
+    )
+    notes_lat = [n.get("item") or "" for n in (g_lat.get("notes") or [])]
+    c.check(
+        "H1 notes end at 수량산출 예",
+        bool(notes_lat) and "수량산출 예" in notes_lat[-1] and not any(x.startswith("(표)") for x in notes_lat),
+        str(notes_lat),
+    )
+
     return c
 
 
