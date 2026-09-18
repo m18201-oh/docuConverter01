@@ -14,27 +14,26 @@ from typing import Any
 
 import pymupdf as fitz
 
-_LOG = logging.getLogger(__name__)
+from .spec import (
+    CIRCLED_CHARS,
+    CODE_FULL,
+    CODE_RE,
+    FIGURE_CAPTION_PREFIXES,
+    HALF_LABOR_RE,
+    HEADER_NORM,
+    INHERIT_CHARS,
+    LABOR_RE,
+    PRICE_RE,
+    PUA_DIGIT_MAP as _PUA_DIGIT_MAP,
+    PUA_POINT_MAP as _PUA_POINT_MAP,
+    PUA_SUPER_MAP as _PUA_SUPER_MAP,
+    STAR_RE,
+    UNIT_NORM,
+    VLINE_MIN_LEN_PT,
+    landscape_gutter_x,
+)
 
-CIRCLED_CHARS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳ⓛ"  # G02i2 F1: ⓛ(U+24DB) 도 ①과 같은 항목 기호
-CODE_RE = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
-CODE_FULL = re.compile(r"^[A-Z]{2}\d{3}\.\d{5}$")
-STAR_RE = re.compile(r"[A-Z]{2}\d{3}\.\d+\*")
-PRICE_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$|^\d+$")
-LABOR_RE = re.compile(r"^\d+(?:\.\d+)?%$")
-HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
-INHERIT_CHARS = set('"\'＂〃“”＇')
-UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton"}
-HEADER_NORM = {
-    "공종코드": "code",
-    "공종명칭": "name",
-    "공종명": "name",
-    "규격": "spec",
-    "단위": "unit",
-    "단가": "price",
-    "노무비율": "labor",
-    "비고": "remark",
-}
+_LOG = logging.getLogger(__name__)
 RAW_FIELDS = (
     "code",
     "name_raw",
@@ -50,7 +49,23 @@ RAW_FIELDS = (
 def _halves(page: fitz.Page) -> list[tuple[str, float, float]]:
     r = page.rect
     if r.width > r.height:
-        mid = r.width / 2
+        v_xs: list[float] = []
+        for d in page.get_drawings():
+            for item in d.get("items", []):
+                if item[0] != "l":
+                    continue
+                p1, p2 = item[1], item[2]
+                if abs(p1.x - p2.x) >= 0.8:
+                    continue
+                y0, y1 = sorted((p1.y, p2.y))
+                if y1 - y0 > r.height * 0.35:
+                    v_xs.append(float((p1.x + p2.x) / 2))
+        word_xs = [
+            (float(w[0]) + float(w[2])) / 2.0
+            for w in page.get_text("words")
+            if w[4]
+        ]
+        mid = landscape_gutter_x(r.width, v_xs, word_xs)
         return [("L", 0.0, mid), ("R", mid, r.width)]
     return [("C", 0.0, r.width)]
 
@@ -95,7 +110,7 @@ def _vlines(page: fitz.Page, drawings: list | None = None) -> list[tuple[float, 
             if abs(p1.x - p2.x) >= 0.8:
                 continue
             y0, y1 = sorted((float(p1.y), float(p2.y)))
-            if y1 - y0 > 15:
+            if y1 - y0 > VLINE_MIN_LEN_PT:
                 out.append((float((p1.x + p2.x) / 2), y0, y1))
     return out
 
@@ -157,20 +172,7 @@ def _is_price_tok(t: str) -> bool:
 
 # G02i2 F4/F5: extract.py _fix_pua_spans 와 같은 대응표·윗첨자 판정을 이 파일
 # 안에서 독립적으로 다시 적용한다(이 파일은 extract.py 함수를 재사용하지 않는다
-# — 파일 맨 위 원칙). page.get_text("words") 는 스팬 경계 없이 공백만으로
-# 낱말을 묶어, PUA 수식(정상 크기+윗첨자 두 스팬)이 한 낱말로 뭉친다 — 그러면
-# 낱말 단위 치환으로는 어느 글자가 윗첨자인지 알 수 없어, 글자(rawdict) 단위로
-# 먼저 교정한 뒤 그 글자들로 낱말 텍스트를 다시 짠다.
-_PUA_DIGIT_MAP = {
-    "\uE034": "1", "\uE035": "2", "\uE037": "4", "\uE038": "5", "\uE039": "6", "\uE03D": "0",
-}  # 코치 핫픽스 09-17: extract.py 와 같은 키 집합 유지(실물 확인분만)
-_PUA_POINT_MAP = {"\uE053": "."}
-_PUA_SUPER_MAP = {
-    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
-    "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
-}
-
-
+# — 파일 맨 위 원칙). 대응표 자체는 spec.PUA_* .
 # extract.py 주석 실측(정상 8.52pt/윗첨자 5.76pt, 정상 12.0pt/윗첨자 8.16pt).
 # 크기 비율 0.85·y 6pt 군집은 extract.py 와 같은 판정의 동어반복이라 쓰지 않는다.
 _PUA_SUPER_SIZES = (5.76, 8.16)
@@ -875,6 +877,7 @@ def _field_gates(
     empty_name: list[dict[str, Any]] = []
     unresolved_inherit: list[dict[str, Any]] = []
     parse_mismatch: list[dict[str, Any]] = []
+    price_unparsed: list[dict[str, Any]] = []
     for rec in records:
         status = (rec.get("status") or "").strip()
         item = {"code": rec.get("code"), "half": rec.get("half"), "pdf_page": rec.get("pdf_page")}
@@ -908,11 +911,16 @@ def _field_gates(
                 mism["spec"] = {"expected": exp_spec, "actual": rec.get("spec"), "raw": rec.get("spec_raw")}
         if mism:
             parse_mismatch.append(dict(item, mismatch=mism))
+        if status == "present" and rec.get("price") is None:
+            raw = (rec.get("price_raw") or "").strip()
+            if raw and "폐지" not in raw:
+                price_unparsed.append(dict(item, price_raw=raw))
     return {
         "empty_name": empty_name,
         "unresolved_inherit": unresolved_inherit,
         "parse_mismatch": parse_mismatch,
         "inherit_mismatch": _inherit_source_gate(records, subheaders or []),
+        "price_unparsed": price_unparsed,
     }
 
 
@@ -1781,7 +1789,7 @@ def _note_word_gate(
                 # 잘못 잡았다(4권 전체 재현, notes_duplicate 가 항상 1). 캡션 줄
                 # 자체는 그 물리적 위치가 곧 "figure" 목적지이므로, 이 줄의 낱말은
                 # item/table 목적지와 겹쳐도 중복 판정에서 제외한다.
-                is_caption_line = (not is_structural_line) and line_txt.lstrip().startswith(("[그림", "[표준도]"))  # 코치 핫픽스 09-17: 표준도 제목 줄
+                is_caption_line = (not is_structural_line) and line_txt.lstrip().startswith(FIGURE_CAPTION_PREFIXES)  # 코치 핫픽스 09-17: 표준도 제목 줄
                 # G02i2 2차(코치 재검, 2024H1 p45#107 ②): 진짜 작은 표 칸 안
                 # 짧은 괄호 문구("(견고하고 미려한 시공이 요구되는 경우)")가
                 # 예시도의 짧은 괄호 설명 규칙(20자 이하 괄호줄)과 우연히
@@ -2000,6 +2008,100 @@ def _note_word_gate(
         "notes_order_mismatch": order_mismatch,
         "gate_page_errors": gate_page_errors,
     }
+
+
+_FIELD_X_SEQ = ("code", "name", "spec", "unit", "price", "labor", "remark")
+_FIELD_X_RAW = {
+    "code": "code",
+    "name": "name_raw",
+    "spec": "spec_raw",
+    "unit": "unit_raw",
+    "price": "price_raw",
+    "labor": "labor_raw",
+    "remark": "remark_raw",
+}
+
+
+def _field_x_order_gate(
+    records: list[dict],
+    words_by_page: dict[int, list[tuple[float, float, float, float, str]]],
+) -> list[dict[str, Any]]:
+    """L3: 레코드 bbox 가 행 전체 폭이라 필드 뒤바뀜을 못 보던 것을, 칸 낱말 x 순서로 본다.
+
+    추출 함수를 재사용하지 않는다. 행 띠 안 원문 낱말의 x 중심이 필드 순서와 어긋나면 기록.
+    """
+    out: list[dict[str, Any]] = []
+    for rec in records:
+        bbox = rec.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        pno = rec.get("pdf_page")
+        if pno is None:
+            continue
+        words = words_by_page.get(int(pno)) or []
+        bx0, by0, bx1, by1 = (float(v) for v in bbox)
+        row = [
+            w
+            for w in words
+            if by0 - 0.5 <= (w[1] + w[3]) / 2.0 < by1 + 0.5
+            and bx0 - 1.0 <= (w[0] + w[2]) / 2.0 <= bx1 + 1.0
+        ]
+        located: list[tuple[int, float, str]] = []
+        for i, fname in enumerate(_FIELD_X_SEQ):
+            if fname == "name" and rec.get("name_inherited"):
+                continue
+            raw = rec.get(_FIELD_X_RAW[fname]) or ""
+            compact = re.sub(r"\s+", "", str(raw))
+            if len(compact) < 2:
+                continue
+            hits = [
+                (w[0] + w[2]) / 2.0
+                for w in row
+                if (w[4] or "") and re.sub(r"\s+", "", w[4]) in compact
+                and len(re.sub(r"\s+", "", w[4])) >= 2
+            ]
+            if not hits:
+                continue
+            located.append((i, sum(hits) / len(hits), fname))
+        if len(located) < 2:
+            continue
+        by_x = sorted(located, key=lambda t: t[1])
+        idx = [t[0] for t in by_x]
+        if idx != sorted(idx):
+            out.append(
+                {
+                    "code": rec.get("code"),
+                    "pdf_page": rec.get("pdf_page"),
+                    "fields": [t[2] for t in by_x],
+                }
+            )
+    return out
+
+
+def _table_shape_gate(table_cache: dict[int, list] | None) -> list[dict[str, Any]]:
+    """L4: 레코드 표(머리글에 단가·공종코드)의 열 수가 8 이상이거나 3 이하이면 정보 경고.
+
+    find_tables 스냅샷만 본다. 주석 속 작은 표는 머리글 조건으로 제외.
+    """
+    out: list[dict[str, Any]] = []
+    if not table_cache:
+        return out
+    for pno, snaps in table_cache.items():
+        for t in _coerce_tables(snaps):
+            rows = []
+            try:
+                rows = t.extract() or []
+            except Exception:  # noqa: BLE001
+                rows = []
+            if not rows:
+                continue
+            head = " ".join(str(c or "") for c in rows[0]).replace(" ", "")
+            if "단가" not in head or "공종코드" not in head:
+                continue
+            n = int(getattr(t, "col_count", 0) or 0)
+            if n >= 8 or n <= 3:
+                out.append({"pdf_page": pno, "col_count": n})
+    return out
 
 
 def check_conservation(
@@ -2288,6 +2390,12 @@ def check_conservation(
     # 영역(PUA) 글자가 남아 있으면 안 된다(pass 조건).
     pua_hits = _pua_scan(result)
     n_pua_chars = len(pua_hits)
+    n_price_unparsed = len(gates.get("price_unparsed") or [])
+    words_by_page = {p: scan.get("words") or [] for p, scan in page_scan.items()}
+    field_x_order = _field_x_order_gate(result.get("records") or [], words_by_page)
+    table_shape_warnings = _table_shape_gate(table_cache)
+    n_field_x_order = len(field_x_order)
+    n_table_shape = len(table_shape_warnings)
 
     return {
         "half": result.get("half"),
@@ -2301,6 +2409,9 @@ def check_conservation(
         "unresolved_inherit": gates["unresolved_inherit"],
         "parse_mismatch": gates["parse_mismatch"],
         "inherit_mismatch": gates["inherit_mismatch"],
+        "price_unparsed": gates.get("price_unparsed") or [],
+        "field_x_order": field_x_order,
+        "table_shape_warnings": table_shape_warnings,
         "notes_missing": note_gate["notes_missing"],
         "notes_duplicate": note_gate["notes_duplicate"],
         "notes_figure_text": note_gate["notes_figure_text"],
@@ -2326,6 +2437,9 @@ def check_conservation(
             "notes_order_mismatch": n_notes_order_mismatch,
             "pua_chars": n_pua_chars,
             "gate_page_errors": n_gate_page_errors,
+            "price_unparsed": n_price_unparsed,
+            "field_x_order": n_field_x_order,
+            "table_shape_warnings": n_table_shape,
             "pass": tot_missing == 0
             and tot_dup == 0
             and tot_split == 0

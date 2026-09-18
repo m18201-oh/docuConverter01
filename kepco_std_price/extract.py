@@ -13,24 +13,31 @@ from pathlib import Path
 import pymupdf as fitz
 
 from .conservation import snapshot_page_tables
+from .spec import (
+    BANNER_RE,
+    BANNER_TRAIL_RE,
+    CIRCLED,
+    CODE_FIND,
+    CODE_RE,
+    FIELD_RE_PDF as FIELD_RE,
+    FIGURE_CAPTION_PREFIXES,
+    HALF_FMT_RE,
+    HALF_LABOR_RE,
+    HEADER_MAP,
+    HEADER_NORM,
+    INHERIT_CHARS,
+    LABOR_RE,
+    MAJOR_NAME_MAX_LEN,
+    PRICE_RE,
+    PUA_DIGIT_MAP as _PUA_DIGIT_MAP,
+    PUA_POINT_MAP as _PUA_POINT_MAP,
+    PUA_SUPER_MAP as _PUA_SUPER_MAP,
+    STAR_FIND,
+    UNIT_NORM,
+    VLINE_MIN_LEN_PT,
+    landscape_gutter_x,
+)
 
-CODE_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
-STAR_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d+\*")
-CODE_RE = CODE_FIND
-PRICE_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$|^\d+$")
-LABOR_RE = re.compile(r"^\d+(?:\.\d+)?%$")
-INHERIT_CHARS = set('"\'＂〃“”＇')
-HEADER_MAP = {
-    "공종코드": "code",
-    "공종명칭": "name",
-    "공종명": "name",
-    "규격": "spec",
-    "단위": "unit",
-    "단가": "price",
-    "노무비율": "labor",
-    "비고": "remark",
-}
-HEADER_NORM = {k.replace(" ", ""): v for k, v in HEADER_MAP.items()}
 # N1: 표 머리글 낱말들만으로 통째로 채워진 줄(칸이 한 줄로 뭉쳐 나온 경우)만
 # 골라내기 위한 전체일치 패턴. 긴 낱말을 먼저 둬 "공종명칭"이 "공종명"에 먼저
 # 먹히지 않게 한다.
@@ -39,7 +46,6 @@ _HEADER_ROW_RE = re.compile(
 )
 DEFAULT6 = ["code", "name", "spec", "unit", "price", "labor"]
 DEFAULT7 = DEFAULT6 + ["remark"]
-FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야자체표준시장단가")
 # review_round3 wrong_notes(2024H2 p145, 2025H2 p95 "RH10* 접지공"): 분야 전환
 # 표지 쪽("건축분야\n2025년 하반기 자체표준시장단가\n2025. 10")은 연도·반기 표시가
 # "분야"와 "자체표준시장단가" 사이에 끼어들어(전체 쪽 글을 이어붙인 문자열에서
@@ -49,16 +55,7 @@ FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야자체표준시장�
 # 자체는 건드리지 않고(불변 유지) "그룹 이어받기를 끊는다"는 판단에만 쓰는 별도
 # 표지쪽 탐지(DIVISION_COVER_RE)를 둔다.
 DIVISION_COVER_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야(?:20\d{2}년[상하]반기)?자체표준시장단가")
-# G02i2 F1: 원문 글자층에서 ①(U+2460) 대신 ⓛ(U+24DB, 동그라미 소문자 l) 로 인쇄된
-# 항목이 있다(폰트 매핑 차이 — 화면엔 똑같이 "①"로 보인다). 글자는 원문대로 두되
-# 항목 경계 판정에서는 ① 과 똑같이 다룬다.
-CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳ⓛ"
-UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton"}
-BANNER_RE = re.compile(r"대분류\s*([A-Z])(?:\s*[,，]\s*([A-Z]))?\s*(.*)$")
-BANNER_TRAIL_RE = re.compile(r"[·.…⋯]+.*$")
-HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
 _EV_ORDER = {"banner": 0, "group": 1, "table": 2, "notes": 3}
-HALF_FMT_RE = re.compile(r"^20\d{2}H[12]$")
 
 # N2: 그림·도식 속에 흩어진 낱말(화살표·거리표시·비교대괄호·품질등급만 나열)만 골라
 # 잡는다. 정상 문장은 이 패턴에 걸리지 않도록 좁게 잡았다(문장부호·조사 없이
@@ -173,22 +170,7 @@ def _sha256(path: str | Path) -> str:
     return h.hexdigest()
 
 
-# G02i2 F4: 4권의 "MA***** 타일공사" ③ 항목(2024H1 p103·2024H2 p206·2025H1
-# p111·2025H2 p144)에 HyhwpEQ 폰트로 인쇄된 수식 글자가 PUA(U+E000~F8FF) 로
-# 남는다. 화면(그림으로 직접 렌더해 확인, 코치 2026-09-17)은 "2.5×10⁴∼
-# 1.0×10⁶Ω, 2.5×10⁴∼1.0×10⁶Ω" — 4권 모두 같은 문장·같은 코드값이다.
-# 실물로 나타난 대응(직접 확인): U+E034→1 U+E035→2 U+E038→5 U+E03D→0
-# U+E053→.(점) U+E037→4(윗첨자 자리) U+E039→6(윗첨자 자리). U+E036·U+E03A~E03C 는
-# 이 4권에 실물로 나타나지 않아 확인하지 못했으므로 대응표에 넣지 않는다(코치
-# 핫픽스 09-17) — 나타나면 그대로 남아 pua_chars 게이트가 잡는다.
-_PUA_DIGIT_MAP = {
-    "\uE034": "1", "\uE035": "2", "\uE037": "4", "\uE038": "5", "\uE039": "6", "\uE03D": "0",
-}
-_PUA_POINT_MAP = {"\uE053": "."}
-_PUA_SUPER_MAP = {
-    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
-    "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
-}
+# G02i2 F4: PUA 대응표는 spec.PUA_* (실물 렌더 확인분만). 함수는 이 파일에 둔다.
 
 
 def _fix_pua_spans(spans: list[Span]) -> None:
@@ -274,8 +256,7 @@ def _page_lines(page: fitz.Page) -> tuple[list[LineSeg], list[LineSeg]]:
                     hs.append(LineSeg(float(x0), float(x1), float((p1.y + p2.y) / 2)))
             elif abs(p1.x - p2.x) < 0.8:
                 y0, y1 = sorted((p1.y, p2.y))
-                # 1행짜리 작은 표는 헤더/데이터 세로선이 ~19.8pt 로 끊긴다.
-                if y1 - y0 > 15:
+                if y1 - y0 > VLINE_MIN_LEN_PT:
                     vs.append(LineSeg(float(y0), float(y1), float((p1.x + p2.x) / 2)))
     return hs, vs
 
@@ -283,7 +264,23 @@ def _page_lines(page: fitz.Page) -> tuple[list[LineSeg], list[LineSeg]]:
 def _halves(page: fitz.Page) -> tuple[str, list[tuple[str, float, float]]]:
     r = page.rect
     if r.width > r.height:
-        mid = r.width / 2
+        v_xs: list[float] = []
+        for d in page.get_drawings():
+            for item in d.get("items", []):
+                if item[0] != "l":
+                    continue
+                p1, p2 = item[1], item[2]
+                if abs(p1.x - p2.x) >= 0.8:
+                    continue
+                y0, y1 = sorted((p1.y, p2.y))
+                if y1 - y0 > r.height * 0.35:
+                    v_xs.append(float((p1.x + p2.x) / 2))
+        word_xs = [
+            (float(w[0]) + float(w[2])) / 2.0
+            for w in page.get_text("words")
+            if w[4]
+        ]
+        mid = landscape_gutter_x(r.width, v_xs, word_xs)
         return "landscape_2up", [("L", 0.0, mid), ("R", mid, r.width)]
     return "portrait_1up", [("C", 0.0, r.width)]
 
@@ -629,7 +626,7 @@ def _major_name_from(raw: str) -> str:
     t = re.sub(r"\s+", "", t)
     if CODE_FIND.search(t) or "공종코드" in t or "공종명" in t:
         return ""
-    if len(t) > 24:
+    if len(t) > MAJOR_NAME_MAX_LEN:
         return ""
     if not re.search(r"[가-힣]{2,}", t):
         return ""
@@ -643,7 +640,7 @@ def _parse_banner_line(line: str) -> tuple[str, str] | None:
     for src in (line, re.sub(r"\s+", "", line)):
         m = BANNER_RE.search(src)
         if m:
-            return m.group(1), _major_name_from(m.group(3) or "")
+            return m.group(1), _major_name_from(m.group(2) or "")
     return None
 
 
@@ -850,7 +847,7 @@ def _build_columns(
     table_x0: float,
     table_x1: float,
     labels: dict[str, float] | None,
-) -> dict[str, tuple[float, float]]:
+) -> tuple[dict[str, tuple[float, float]], list[str]]:
     extra = []
     if labels and len(labels) >= 2 and len(vxs) < max(5, len(labels) - 1):
         xs = sorted(labels.values())
@@ -913,7 +910,13 @@ def _build_columns(
         nx0, nx1 = colmap["name"]
         if nx0 - table_x0 > 30:
             colmap["code"] = (table_x0, nx0)
-    return colmap
+    shape: list[str] = []
+    if len(cols) >= 8:
+        extra = len(cols) - len(colmap)
+        shape.append(f"record_table_cols={len(cols)} (>=8) extra_unmapped={max(0, extra)}")
+    if len(cols) <= 3:
+        shape.append(f"record_table_cols={len(cols)} (<=3) mapped={sorted(colmap)}")
+    return colmap, shape
 
 
 def _col(colmap: dict[str, tuple[float, float]], name: str, fallback: tuple[float, float]) -> tuple[float, float]:
@@ -922,8 +925,7 @@ def _col(colmap: dict[str, tuple[float, float]], name: str, fallback: tuple[floa
 
 # 코치 핫픽스 09-17: 「[표준도] 우수맨홀(900×900) …」 줄도 그림 제목이다(표준도 그림
 # 바로 위 제목 줄). [그림 과 같게 figures 로 보낸다 — 주석 ③ 끝에 붙던 결함.
-FIGURE_CAPTION_PREFIXES = ("[그림", "[표준도]")
-
+# FIGURE_CAPTION_PREFIXES 는 spec 공용 상수.
 
 def _is_figure_caption_line(text: str) -> bool:
     return text.lstrip().startswith(FIGURE_CAPTION_PREFIXES)
@@ -1477,25 +1479,46 @@ def extract_pdf(
     pages: tuple[int, int] | None = None,
 ) -> dict:
     pdf_path = Path(pdf_path)
-    doc = fitz.open(pdf_path)
+    if not pdf_path.exists():
+        raise ValidationError(f"PDF 파일이 없습니다: {pdf_path}")
+    try:
+        size = pdf_path.stat().st_size
+    except OSError as e:
+        raise ValidationError(f"PDF 파일을 읽을 수 없습니다: {pdf_path}") from e
+    if size == 0:
+        raise ValidationError(f"PDF 파일이 비어 있습니다: {pdf_path}")
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        raise ValidationError(f"손상된 PDF 이거나 열 수 없습니다: {pdf_path}") from e
+    if doc.page_count < 1:
+        doc.close()
+        raise ValidationError(f"페이지가 없는 PDF 입니다: {pdf_path}")
     try:
         half_warnings = _validate_half(half, pdf_path)
         _validate_pages(pages, doc.page_count)
     except Exception:
         doc.close()
         raise
-    sha = _sha256(pdf_path)
-    field_starts = _scan_fields(doc)
-    division_covers = _scan_division_covers(doc)
     start, end = (1, doc.page_count) if pages is None else pages
     start = max(1, start)
     end = min(doc.page_count, end)
+    nchars = 0
+    for pno in range(start, end + 1):
+        nchars += len(doc[pno - 1].get_text("text") or "")
+    if nchars == 0:
+        doc.close()
+        raise ValidationError(f"글자층이 없는 PDF 입니다: {pdf_path}")
+    sha = _sha256(pdf_path)
+    field_starts = _scan_fields(doc)
+    division_covers = _scan_division_covers(doc)
 
     records: list[dict] = []
     groups: list[dict] = []
     subheaders: list[dict] = []
     pages_out: list[dict] = []
     warnings: list[str] = list(half_warnings)
+    table_shape_warnings: list[dict] = []
     table_cache: dict[int, list] = {}
 
     last_group: dict | None = None
@@ -1967,7 +1990,14 @@ def extract_pdf(
 
                     vxs = _vxs_near(vlines, y_min - 50, y_max + 20, table_x0, table_x1)
                     real_vxs = list(vxs)
-                    colmap = _build_columns(vxs, table_x0, table_x1, lab)
+                    colmap, shape_ws = _build_columns(vxs, table_x0, table_x1, lab)
+                    if lab and "price" in lab:
+                        for sw in shape_ws:
+                            msg = f"table_shape pdf_page={pno} page_half={ph}: {sw}"
+                            warnings.append(msg)
+                            table_shape_warnings.append(
+                                {"pdf_page": pno, "page_half": ph, "detail": sw}
+                            )
                     if "code" not in colmap and last_colmap and "code" in last_colmap:
                         old0 = min(a for a, _ in last_colmap.values())
                         old1 = max(b for _, b in last_colmap.values())
@@ -2139,9 +2169,12 @@ def extract_pdf(
 
                         spec = _collapse(spec_raw) if spec_raw.strip() else spec_raw.strip()
 
-                        # 단가 없는 코드는 본문 아님 (이중 방어)
+                        # L2: 소수·범위·단위가 붙은 단가는 드롭하지 않고 price=null 로 남긴다.
+                        # 단가 칸이 아예 비어 있는 가짜 행은 기존처럼 본문이 아니다.
                         if status == "present" and price is None and "폐지" not in (price_tok or ""):
-                            continue
+                            raw_keep = (price_tok or price_raw or "").strip()
+                            if not raw_keep:
+                                continue
                         if status == "present" and price_tok and not _price_word_complete(
                             price_tok, words_all, price_col, y0, y1
                         ):
@@ -2265,5 +2298,6 @@ def extract_pdf(
         "sha256": sha,
         "half": half,
         "warnings": warnings,
+        "table_shape_warnings": table_shape_warnings,
         "_table_cache": table_cache,
     }

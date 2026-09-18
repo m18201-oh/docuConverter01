@@ -13,53 +13,31 @@ from pathlib import Path
 from lxml import etree
 
 from .extract import ValidationError
+from .spec import (
+    BANNER_RE,
+    BANNER_TRAIL_RE,
+    CIRCLED,
+    CODE_FIND,
+    DIST_RANGE_RE,
+    FIELD_RE_HWP as FIELD_RE,
+    FIGURE_CAPTION_PREFIXES,
+    HALF_FMT_RE,
+    HALF_LABOR_RE,
+    HEADER_MAP,
+    HEADER_NORM,
+    INHERIT_CHARS,
+    LABOR_RE,
+    MAJOR_NAME_MAX_LEN,
+    PRICE_RE,
+    PUA_DIGIT_MAP as _PUA_DIGIT_MAP,
+    PUA_POINT_MAP as _PUA_POINT_MAP,
+    PUA_SUPER_MAP as _PUA_SUPER_MAP,
+    STAR_FIND,
+    UNIT_NORM,
+)
 
-CODE_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
-STAR_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d+\*")
-PRICE_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$|^\d+$")
-LABOR_RE = re.compile(r"^\d+(?:\.\d+)?%$")
-INHERIT_CHARS = set("\"'＂〃“”＇")
-HEADER_MAP = {
-    "공종코드": "code",
-    "공종명칭": "name",
-    "공종명": "name",
-    "규격": "spec",
-    "단위": "unit",
-    "단가": "price",
-    "노무비율": "labor",
-    "비고": "remark",
-}
-HEADER_NORM = {k.replace(" ", ""): v for k, v in HEADER_MAP.items()}
-UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton"}
-BANNER_RE = re.compile(r"대분류\s*([A-Z])(?:\s*[,，]\s*([A-Z]))?\s*(.*)$")
-HALF_LABOR_RE = re.compile(r"^[‘'′`]?\d{2}[상하]")
-HALF_FMT_RE = re.compile(r"^20\d{2}H[12]$")
-FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야(?:자체표준시장단가)?")
-CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳ⓛ"
-FIGURE_CAPTION_PREFIXES = ("[그림", "[표준도]")
 _STOP = ("TableControl", "GShapeObjectControl")
 _KNOWN_FIELDS = {"토목", "건축", "기계설비및소방설비"}
-_PUA_DIGIT_MAP = {
-    "\uE034": "1",
-    "\uE035": "2",
-    "\uE037": "4",
-    "\uE038": "5",
-    "\uE039": "6",
-    "\uE03D": "0",
-}
-_PUA_POINT_MAP = {"\uE053": "."}
-_PUA_SUPER_MAP = {
-    "0": "⁰",
-    "1": "¹",
-    "2": "²",
-    "3": "³",
-    "4": "⁴",
-    "5": "⁵",
-    "6": "⁶",
-    "7": "⁷",
-    "8": "⁸",
-    "9": "⁹",
-}
 
 
 def _sha256(path: str | Path) -> str:
@@ -244,11 +222,11 @@ def _parse_banner(cells: list[dict]) -> tuple[str, str] | None:
         m = BANNER_RE.search(cand)
         if m:
             letter = m.group(1)
-            name = right or re.sub(r"\s+", "", m.group(3) or "")
-            name = re.sub(r"[·.…⋯]+.*$", "", name)
+            name = right or re.sub(r"\s+", "", m.group(2) or "")
+            name = BANNER_TRAIL_RE.sub("", name)
             name = re.sub(r"\d+$", "", name)
-            if len(name) > 24:
-                name = name[:24]
+            if len(name) > MAJOR_NAME_MAX_LEN:
+                name = name[:MAJOR_NAME_MAX_LEN]
             return letter, name
     return None
 
@@ -308,6 +286,16 @@ def _is_diagram_table(rows: list[list[dict]]) -> bool:
     if compact.startswith("건축분야") or compact.startswith("토목분야"):
         return True
     if "자체단가의적용방법" in compact:
+        return True
+    # H1: 수량산출 예 굴진방향 도식 — 공종코드+거리구간이고 단가(천단위 쉼표) 없음
+    has_price_comma = bool(re.search(r"\d{1,3}(?:,\d{3})+", blob))
+    has_code = bool(CODE_FIND.search(blob))
+    has_dist = bool(DIST_RANGE_RE.search(blob) or DIST_RANGE_RE.search(compact))
+    if has_code and has_dist and not has_price_comma:
+        return True
+    if "품셈으로산출" in compact and not has_price_comma and (
+        has_code or has_dist or any(q in compact for q in ("양호", "보통", "불량"))
+    ):
         return True
     return False
 
@@ -574,6 +562,14 @@ def extract_from_root(
         current_sub = last_sub
         prev_name = last_prev_name
         has_remark = "remark" in colmap.values()
+        if ncols >= 8:
+            warnings.append(
+                f"table_shape section={section_id} para={para_index}: record_table_cols={ncols} (>=8)"
+            )
+        if ncols <= 3:
+            warnings.append(
+                f"table_shape section={section_id} para={para_index}: record_table_cols={ncols} (<=3) mapped={sorted(colmap.values())}"
+            )
 
         for cells in rows[1:]:
             row_no = cells[0]["row"] if cells else 0
@@ -683,7 +679,9 @@ def extract_from_root(
             spec = _collapse(spec_raw) if spec_raw.strip() else spec_raw.strip()
 
             if status == "present" and price is None and "폐지" not in (price_tok or ""):
-                continue
+                raw_keep = (price_tok or price_raw or "").strip()
+                if not raw_keep:
+                    continue
 
             rec = {
                 "key": f"{code}@{half}",
@@ -835,9 +833,26 @@ def extract_from_root(
 
 def extract_hwp(hwp_path: str | Path, half: str) -> dict:
     hwp_path = Path(hwp_path)
+    if not hwp_path.exists():
+        raise ValidationError(f"HWP 파일이 없습니다: {hwp_path}")
+    try:
+        size = hwp_path.stat().st_size
+    except OSError as e:
+        raise ValidationError(f"HWP 파일을 읽을 수 없습니다: {hwp_path}") from e
+    if size == 0:
+        raise ValidationError(f"HWP 파일이 비어 있습니다: {hwp_path}")
     warnings = _validate_half(half, hwp_path)
     sha = _sha256(hwp_path)
-    root = _hwp_to_root(hwp_path)
+    try:
+        root = _hwp_to_root(hwp_path)
+    except ValidationError:
+        raise
+    except Exception as e:
+        raise ValidationError(f"손상된 HWP 이거나 열 수 없습니다: {hwp_path}") from e
+    body = root.find("BodyText")
+    text_blob = "".join(body.itertext()) if body is not None else ""
+    if not re.search(r"[가-힣A-Za-z0-9]", text_blob or ""):
+        raise ValidationError(f"글자층이 없는 HWP 입니다: {hwp_path}")
     result = extract_from_root(root, half, sha, source_path=hwp_path)
     # _validate_half 을 extract_from_root 에서도 호출하므로 중복 경고를 접는다
     seen: set[str] = set()
