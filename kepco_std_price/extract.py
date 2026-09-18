@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pymupdf as fitz
 
+from .conservation import snapshot_page_tables
+
 CODE_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
 STAR_FIND = re.compile(r"[A-Z]{2}\d{3}\.\d+\*")
 CODE_RE = CODE_FIND
@@ -1494,6 +1496,7 @@ def extract_pdf(
     subheaders: list[dict] = []
     pages_out: list[dict] = []
     warnings: list[str] = list(half_warnings)
+    table_cache: dict[int, list] = {}
 
     last_group: dict | None = None
     last_colmap: dict[str, tuple[float, float]] | None = None
@@ -1528,12 +1531,6 @@ def extract_pdf(
         # 그 사이 글줄을 어느 그룹에도 붙이지 않는다.
         if last_group is not None and last_group.get("field") not in (None, page_field):
             last_group = None
-        # review_round3: page_field(=FIELD_RE) 판정이 한 쪽 늦게 걸리는 분야 전환
-        # 표지 쪽(위 DIVISION_COVER_RE 주석 참고)에서도 그룹 이어받기를 끊는다.
-        # page_field 값 자체는 그대로 두어(records.jsonl·pages.jsonl 불변 유지)
-        # 오직 이 판단에만 쓴다.
-        if pno in division_covers:
-            last_group = None
         spans_all = _page_spans(page)
         chars_all = _page_chars(page)
         words_all = [
@@ -1551,10 +1548,25 @@ def extract_pdf(
             tables = list(tabs.tables) if tabs else []
         except Exception:
             tables = []
+        table_cache[pno] = snapshot_page_tables(tables)
         printed_map: dict[str, int] = {}
         min_w = page.rect.width * (0.35 if layout == "landscape_2up" else 0.45)
 
+        # K6: 분야 표지 리셋은 쪽 전체가 아니라 표지 문구가 있는 단에서만.
+        # 단 단위로 문구가 안 잡히면(쪽이 이어져 보일 때) 예전처럼 쪽 단위 리셋.
+        cover_halves: set[str] = set()
+        if pno in division_covers:
+            for ph, hx0, hx1 in halves:
+                half_spans = [s for s in spans_all if _in_half(s, hx0, hx1)]
+                compact = "".join(s.text for s in half_spans).replace(" ", "").replace("\n", "")
+                if DIVISION_COVER_RE.search(compact):
+                    cover_halves.add(ph)
+            if not cover_halves:
+                last_group = None
+
         for ph, hx0, hx1 in halves:
+            if ph in cover_halves:
+                last_group = None
             spans = [s for s in spans_all if _in_half(s, hx0, hx1)]
             chars = [s for s in chars_all if _in_half(s, hx0, hx1)]
             printed = _printed(spans_all, hx0, hx1, page.rect.height)
@@ -2253,4 +2265,5 @@ def extract_pdf(
         "sha256": sha,
         "half": half,
         "warnings": warnings,
+        "_table_cache": table_cache,
     }

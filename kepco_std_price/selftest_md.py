@@ -589,6 +589,16 @@ def run_all() -> Check:
             md_c,
         )
 
+    # K3③: conservation.py 와 extract.py 의 PUA 숫자 대응표 키 집합이 같아야 한다.
+    from .conservation import _PUA_DIGIT_MAP as _GATE_PUA
+    from .extract import _PUA_DIGIT_MAP as _EXTRACT_PUA
+
+    c.check(
+        "K3 PUA digit map keys identical (extract vs conservation)",
+        set(_GATE_PUA.keys()) == set(_EXTRACT_PUA.keys()),
+        f"extract={sorted(_EXTRACT_PUA)} gate={sorted(_GATE_PUA)}",
+    )
+
     return c
 
 

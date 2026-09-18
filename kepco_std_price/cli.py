@@ -89,8 +89,9 @@ def main(argv: list[str] | None = None) -> int:
         print("오류: 추출된 레코드가 0건입니다.", file=sys.stderr)
         exit_code = 1
 
+    table_cache = result.pop("_table_cache", None)
     if args.check_conservation:
-        report = check_conservation(args.pdf, result, pages=pages)
+        report = check_conservation(args.pdf, result, pages=pages, table_cache=table_cache)
         (out / "conservation.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -112,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             f"notes_figure_text={tot.get('notes_figure_text')} "
             f"notes_order_mismatch={tot.get('notes_order_mismatch')} "
             f"pua_chars={tot.get('pua_chars')} "
+            f"gate_page_errors={tot.get('gate_page_errors')} "
             f"pass={tot.get('pass')}",
             flush=True,
         )

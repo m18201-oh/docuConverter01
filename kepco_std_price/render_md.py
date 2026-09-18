@@ -268,7 +268,7 @@ def _read_verified(md_dir: Path, md_resolved: Path, relpath: str, target: Path) 
     """target 을 열어 그 내용을 읽는다. 열자마자(=다른 코드를 끼우지 않고) 실제로
     연 대상이 여전히 md 안인지 한번 더 확인한다(읽기 자체의 경합 창도 최소화).
     """
-    fd = os.open(str(target), os.O_RDONLY | os.O_BINARY)
+    fd = os.open(str(target), os.O_RDONLY | getattr(os, "O_BINARY", 0))
     try:
         reverified = _safe_join(md_dir, relpath, md_resolved)
         if reverified is None or reverified.is_symlink() or reverified.is_junction():

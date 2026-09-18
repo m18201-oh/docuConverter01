@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import bisect
 import difflib
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 import pymupdf as fitz
+
+_LOG = logging.getLogger(__name__)
 
 CIRCLED_CHARS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳ⓛ"  # G02i2 F1: ⓛ(U+24DB) 도 ①과 같은 항목 기호
 CODE_RE = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
@@ -65,10 +68,10 @@ def _cluster(vals: list[float], tol: float) -> list[float]:
     return [sum(g) / len(g) for g in groups]
 
 
-def _wide_h(page: fitz.Page) -> list[tuple[float, float, float]]:
+def _wide_h(page: fitz.Page, drawings: list | None = None) -> list[tuple[float, float, float]]:
     """(x0, x1, y) 가로 벡터 선. 짧은 선은 버린다."""
     out: list[tuple[float, float, float]] = []
-    for d in page.get_drawings():
+    for d in (drawings if drawings is not None else page.get_drawings()):
         for item in d.get("items", []):
             if item[0] != "l":
                 continue
@@ -81,10 +84,10 @@ def _wide_h(page: fitz.Page) -> list[tuple[float, float, float]]:
     return out
 
 
-def _vlines(page: fitz.Page) -> list[tuple[float, float, float]]:
+def _vlines(page: fitz.Page, drawings: list | None = None) -> list[tuple[float, float, float]]:
     """(x, y0, y1) 세로 벡터 선. 1행 표 ~19.8pt 도 포함한다."""
     out: list[tuple[float, float, float]] = []
-    for d in page.get_drawings():
+    for d in (drawings if drawings is not None else page.get_drawings()):
         for item in d.get("items", []):
             if item[0] != "l":
                 continue
@@ -168,10 +171,25 @@ _PUA_SUPER_MAP = {
 }
 
 
+# extract.py 주석 실측(정상 8.52pt/윗첨자 5.76pt, 정상 12.0pt/윗첨자 8.16pt).
+# 크기 비율 0.85·y 6pt 군집은 extract.py 와 같은 판정의 동어반복이라 쓰지 않는다.
+_PUA_SUPER_SIZES = (5.76, 8.16)
+_PUA_SIZE_TOL = 0.05
+
+
+def _pua_is_superscript(sz: float, flags: int) -> bool:
+    """rawdict 스팬 flags 의 윗첨자 비트(MuPDF bit 0) 또는 실측 윗첨자 크기 정확 일치."""
+    if flags & 1:
+        return True
+    if sz <= 0:
+        return False
+    return any(abs(sz - super_sz) <= _PUA_SIZE_TOL for super_sz in _PUA_SUPER_SIZES)
+
+
 def _pua_corrected_chars(page: fitz.Page) -> list[tuple[float, float, float, float, str]]:
-    """이 쪽에서 대응표에 있는 PUA 글자만, 같은 줄(y 6pt 이내)의 다른 글자보다
-    작은(85% 미만) 크기면 윗첨자로 바꿔 (bbox, 교정 글자) 목록으로 돌려준다."""
-    raw: list[tuple[float, float, float, float, float, str]] = []  # x0,y0,x1,y1,size,char
+    """이 쪽에서 대응표에 있는 PUA 글자만, 윗첨자면 윗첨자 숫자로 바꿔
+    (bbox, 교정 글자) 목록으로 돌려준다."""
+    raw: list[tuple[float, float, float, float, float, str, int]] = []
     rd = page.get_text("rawdict")
     for b in rd.get("blocks", []):
         if b.get("type") != 0:
@@ -179,32 +197,22 @@ def _pua_corrected_chars(page: fitz.Page) -> list[tuple[float, float, float, flo
         for line in b.get("lines", []):
             for s in line.get("spans", []):
                 sz = float(s.get("size") or 0.0)
+                flags = int(s.get("flags") or 0)
                 for c in s.get("chars") or []:
                     ch = c.get("c") or ""
                     if ch in _PUA_DIGIT_MAP or ch in _PUA_POINT_MAP:
                         x0, y0, x1, y1 = c["bbox"]
-                        raw.append((float(x0), float(y0), float(x1), float(y1), sz, ch))
+                        raw.append((float(x0), float(y0), float(x1), float(y1), sz, ch, flags))
     if not raw:
         return []
-    raw.sort(key=lambda r: (r[1] + r[3]) / 2)
-    lines: list[list[tuple[float, float, float, float, float, str]]] = []
-    for r in raw:
-        yc = (r[1] + r[3]) / 2
-        if lines and abs(yc - (lines[-1][-1][1] + lines[-1][-1][3]) / 2) <= 6.0:
-            lines[-1].append(r)
-        else:
-            lines.append([r])
     out: list[tuple[float, float, float, float, str]] = []
-    for ln in lines:
-        sizes = [r[4] for r in ln if r[4] > 0]
-        base = max(sizes) if sizes else 0.0
-        for x0, y0, x1, y1, sz, ch in ln:
-            is_super = base > 0 and sz > 0 and sz < base * 0.85
-            if ch in _PUA_DIGIT_MAP:
-                d = _PUA_DIGIT_MAP[ch]
-                out.append((x0, y0, x1, y1, _PUA_SUPER_MAP[d] if is_super else d))
-            else:
-                out.append((x0, y0, x1, y1, _PUA_POINT_MAP[ch]))
+    for x0, y0, x1, y1, sz, ch, flags in raw:
+        is_super = _pua_is_superscript(sz, flags)
+        if ch in _PUA_DIGIT_MAP:
+            d = _PUA_DIGIT_MAP[ch]
+            out.append((x0, y0, x1, y1, _PUA_SUPER_MAP[d] if is_super else d))
+        else:
+            out.append((x0, y0, x1, y1, _PUA_POINT_MAP[ch]))
     return out
 
 
@@ -362,10 +370,16 @@ def _table_x(
     return tx0, tx1
 
 
-def _table_bodies(page: fitz.Page) -> list[tuple[float, float, float, float]]:
+def _table_bodies(
+    page: fitz.Page,
+    words: list[tuple[float, float, float, float, str]] | None = None,
+    hlines: list[tuple[float, float, float]] | None = None,
+) -> list[tuple[float, float, float, float]]:
     """본문 영역 사각형 (x0,y0,x1,y1). 헤더 행 아래 ~ 표 바닥."""
-    words = _words(page)
-    hlines = _wide_h(page)
+    if words is None:
+        words = _words(page)
+    if hlines is None:
+        hlines = _wide_h(page)
     layout_minw = page.rect.width * (0.35 if page.rect.width > page.rect.height else 0.45)
     bodies: list[tuple[float, float, float, float]] = []
     for _ph, hx0, hx1 in _halves(page):
@@ -919,21 +933,75 @@ _NOTE_EVAL_RE = re.compile(r"^(?:부적정|적\s*정)$")
 _NOTE_EVAL_REASON_RE = re.compile(r"^(?:부적정|적정)\(사유[:：]")
 
 
-def _image_boxes(page: fitz.Page) -> list[tuple[float, float, float, float]]:
+class _CachedTable:
+    """CLI/extract 가 넘긴 find_tables() 스냅샷. 게이트가 extract 판정 함수를
+    부르지 않고 bbox·col_count·extract()·rows.cells 만 재사용한다."""
+
+    def __init__(self, snap: dict[str, Any]):
+        self.bbox = snap["bbox"]
+        self.col_count = snap["col_count"]
+        self._extract_rows = snap.get("extract") or []
+        self.rows = [type("_Row", (), {"cells": row})() for row in (snap.get("row_cells") or [])]
+
+    def extract(self) -> list:
+        return self._extract_rows
+
+
+def snapshot_page_tables(tables: list) -> list[dict[str, Any]]:
+    """find_tables() Table 목록을 문서가 닫혀도 쓸 수 있는 스냅샷으로."""
+    snaps: list[dict[str, Any]] = []
+    for t in tables:
+        try:
+            extracted = t.extract() or []
+        except Exception:  # noqa: BLE001
+            extracted = []
+        try:
+            row_cells = [[tuple(float(v) for v in c) for c in r.cells] for r in t.rows]
+        except Exception:  # noqa: BLE001
+            row_cells = []
+        snaps.append(
+            {
+                "bbox": tuple(float(v) for v in t.bbox),
+                "col_count": int(getattr(t, "col_count", 0) or 0),
+                "extract": extracted,
+                "row_cells": row_cells,
+            }
+        )
+    return snaps
+
+
+def _coerce_tables(items: list | None) -> list:
+    if not items:
+        return []
+    out = []
+    for t in items:
+        out.append(_CachedTable(t) if isinstance(t, dict) else t)
+    return out
+
+
+def _image_boxes(page: fitz.Page, errors: list | None = None) -> list[tuple[float, float, float, float]]:
     try:
         return [tuple(float(v) for v in im["bbox"]) for im in page.get_image_info()]
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        pno = int(getattr(page, "number", -1)) + 1
+        _LOG.warning("get_image_info failed (page %s): %s", pno, e)
+        if errors is not None:
+            errors.append({"page": pno, "where": "get_image_info", "error": str(e)})
         return []
 
 
-def _page_tables(page: fitz.Page) -> list:
-    """이 쪽의 find_tables() 결과(Table 목록)를 한 번만 부른다 — 같은 쪽에서
-    _diagram_legend_boxes()·_note_subtables() 가 각자 다시 부르면(원래 방식)
-    비용이 두 배가 돼(F5 order_mismatch 게이트 전 쪽 스캔에서 실측) 4권
-    전체 실행이 눈에 띄게 느려졌다."""
+def _page_tables(page: fitz.Page, cached: list | None = None, errors: list | None = None) -> list:
+    """이 쪽의 find_tables() 결과(Table 목록). 캐시가 있으면 재사용하고
+    없을 때만 쪽마다 다시 부른다."""
+    if cached is not None:
+        return _coerce_tables(cached)
     try:
         tabs = page.find_tables()
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        pno = int(getattr(page, "number", -1)) + 1
+        _LOG.warning("find_tables failed (page %s): %s", pno, e)
+        if errors is not None:
+            errors.append({"page": pno, "where": "find_tables", "error": str(e)})
         return []
     return list(tabs.tables) if tabs else []
 
@@ -1199,7 +1267,11 @@ def _note_line_is_structural(text: str) -> bool:
     # N8-scope-suspect): 표 소구간 표제("- 초기굴진"·"- 굴진 총연장 150m이하")와
     # 분야 전환 표지도 애초에 notes 항목에 안 들어가므로 게이트에서도 뺀다.
     if t.startswith("- ") and re.search(r"(총연장|초과|이하)", t) and "단가" not in t:
-        return True
+        # K3: extract.py 와 글자 그대로 같은 넓은 규칙을 쓰지 않는다.
+        # 짧은 제목 꼴(문장 종결 아니고 길이 상한)만 구조 표지로 본다 — 진짜
+        # 문장을 버린 추출기 결함을 잡기 위함.
+        if len(t) <= 48 and not re.search(r"(다|함|음|임|됨|이다|한다|된다)\.\s*$", t):
+            return True
     if re.fullmatch(r"-\s*(초기굴진|본굴진|도달굴진)", t):
         return True
     if "자체표준시장단가" in compact:
@@ -1213,7 +1285,76 @@ def _note_line_is_structural(text: str) -> bool:
     # (_is_structural_note_junk 의 같은 조건 참고).
     if re.fullmatch(r"\[[^\[\]]{1,20}\]", t):
         return True
+    if t.startswith("○") or compact.startswith("○"):
+        return True
+    if compact.startswith("목차") or t.startswith("목차"):
+        return True
+    first_tok = t.split()[0] if t.split() else ""
+    if CODE_RE.match(first_tok) or re.match(r"^[A-Z]{2}\d+\*", first_tok):
+        return True
+    # 색인 줄 머리 장식(n DH419.11505 …) — 항목 기호 ① 이 아님
+    if re.match(r"^n\s*[A-Z]{2}\d", t.strip()):
+        return True
     return False
+
+
+def _band_source_ends_owner(
+    band_words: list[tuple[float, float, float, float, str]],
+    by0: float,
+    bodies: list[tuple[float, float, float, float]],
+    hx0: float,
+    hx1: float,
+) -> bool:
+    """신호 없는 밴드를 건너뛸지 — 산출이 아니라 원문 구조 신호로만 판정.
+
+    이 밴드가 (a) 다음 ■ 머리글·대분류 배너·표 시작·분야 표지·쪽 번호 머리말
+    뒤에 있거나 (b) 그룹 종결을 뜻하는 구조 요소 뒤에 있으면 True(owner 없음).
+    그 밖의 신호 없는 밴드는 직전 owner 의 이어짐이므로 False.
+    """
+    if not band_words:
+        return True
+    for b in bodies:
+        if b[2] <= hx0 + 1 or b[0] >= hx1 - 1:
+            continue
+        if b[3] <= by0 + 2.0 and (by0 - b[3]) < 30.0:
+            return True
+    lines = _cluster_word_lines(band_words)
+    for line in lines:
+        sorted_line = sorted(line, key=lambda w: w[0])
+        txt = " ".join(w[4] for w in sorted_line).strip()
+        if not txt:
+            continue
+        compact = txt.replace(" ", "")
+        # 쪽 번호 한 줄은 머리말로 건너뛰고, 그것만으로 밴드 전체를 버리지는 않는다
+        # (이어짐 쪽 맨 위 `- N -` 뒤에 진짜 문장이 오는 경우가 있다).
+        if re.fullmatch(r"-\s*\d+\s*-", txt):
+            continue
+        if txt.startswith("■") or compact.startswith("■"):
+            return True
+        if compact.startswith("대분류"):
+            return True
+        core = compact.lstrip("○●•∙·")
+        if core.startswith("대분류"):
+            return True
+        if txt.startswith("○") or compact.startswith("○"):
+            return True
+        if txt.startswith("목차") or compact.startswith("목차"):
+            return True
+        if "자체표준시장단가" in compact:
+            return True
+        if re.fullmatch(r"[가-힣·ㆍ‧･․]{2,12}분야", compact):
+            return True
+        if re.fullmatch(r"\d{4}\.\s*\d{1,2}", txt):
+            return True
+        if "공종코드" in compact or "공종명칭" in compact or "공종명" in compact:
+            return True
+        first_tok = txt.split()[0] if txt.split() else ""
+        if CODE_RE.match(first_tok) or re.match(r"^[A-Z]{2}\d+\*", first_tok):
+            return True
+        if any(CODE_RE.match(tok) or re.match(r"^[A-Z]{2}\d+\*", tok) for tok in txt.split()[:3]):
+            return True
+        return False
+    return True
 
 
 def _line_has_diagram_signal(
@@ -1307,12 +1448,19 @@ def _group_destinations(g: dict) -> tuple[str, str, str, str]:
     return "\n".join(item_parts), "\n".join(table_parts), fig_blob, "\n".join(notes_only_parts)
 
 
-def _group_output_chars(g: dict) -> str:
-    """G02i2 F5: 그룹 notes 를 출력(읽기) 순서 그대로 이어 붙인 공백 없는
-    문자열. 부표 항목은 "(표)"·"[표]"·"|"·"/" 같은 합성 구분자를 떼고 칸
-    글자만 남긴다(그 구분자는 원문에 없는 서식일 뿐이라 비교 대상이 아니다)."""
+def _group_output_chars(g: dict, pages: tuple[int, int] | None = None) -> str:
+    """G02i2 F5: 그룹 notes 를 출력(읽기) 순서 그대로 이어 붙인 공백 없는 문자열.
+
+    부표 항목은 합성 구분자를 떼고 칸 글자만 남긴다.
+    pages 가 있으면 그 범위 안 pdf_page 항목만 넣는다(K2 부분 실행).
+    """
     parts: list[str] = []
+    lo, hi = pages if pages is not None else (None, None)
     for n in g.get("notes") or []:
+        if lo is not None and hi is not None:
+            np = n.get("pdf_page")
+            if not isinstance(np, int) or not (lo <= np <= hi):
+                continue
         item = str(n.get("item") or "")
         if n.get("subtable") or item.startswith("(표)") or item.startswith("[표]"):
             body = item
@@ -1396,6 +1544,7 @@ def _augment_order_with_headers(
     doc: fitz.Document,
     start: int,
     end: int,
+    page_scan: dict[int, dict[str, Any]] | None = None,
 ) -> None:
     """레코드가 하나도 없는(표 없이 주석만 있는 서술형) 그룹은 _group_reading_order
     가 전혀 못 잡는다 — 그 함수는 오직 records 의 bbox 로만 그룹의 문서상 위치를
@@ -1413,10 +1562,13 @@ def _augment_order_with_headers(
         key = (int(pno), g.get("page_half") or "C")
         groups_by_key.setdefault(key, []).append(g)
     for (pno, ph), glist in groups_by_key.items():
-        if pno < start or pno > end:
+        if pno > end:
             continue
+        # K2: pno < start 머리글도 타임라인에 올린다(범위 시작 직전 그룹의
+        # 범위 안 이어짐이 owner=None 으로 새지 않게).
         page = doc[pno - 1]
-        words = _words(page)
+        scanned_words = (page_scan or {}).get(pno, {}).get("words")
+        words = scanned_words if scanned_words is not None else _words(page)
         hx0 = hx1 = None
         for _p, x0, x1 in _halves(page):
             if _p == ph:
@@ -1446,18 +1598,23 @@ def _note_word_gate(
     pdf_path: str | Path,
     result: dict[str, Any],
     pages: tuple[int, int] | None,
+    table_cache: dict[int, list] | None = None,
+    doc: fitz.Document | None = None,
+    page_scan: dict[int, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     groups = result.get("groups") or []
     records = result.get("records") or []
     subheaders = result.get("subheaders") or []
     pdf_path = Path(pdf_path)
-    doc = fitz.open(pdf_path)
+    own_doc = doc is None
+    if doc is None:
+        doc = fitz.open(pdf_path)
     start, end = (1, doc.page_count) if pages is None else pages
     start = max(1, start)
     end = min(doc.page_count, end)
 
     order = _group_reading_order(groups, records)
-    _augment_order_with_headers(order, groups, doc, start, end)
+    _augment_order_with_headers(order, groups, doc, start, end, page_scan=page_scan)
     # N8-scope: 쪽·단을 넘어 이어지는 그룹(표가 이전 쪽에서 시작해 이 쪽까지
     # 이어지는 경우)의 소유권을 (쪽,단) 키 하나만으로는 못 잡는다 — 이 쪽·단에
     # 이 그룹 자신의 표 조각이 아직 없으면(표 다음 조각이 이 쪽 더 아래에서
@@ -1502,13 +1659,21 @@ def _note_word_gate(
     # 그대로 모은다(missing/duplicate 판정과 정확히 같은 시점·같은 제외
     # 기준의 낱말 집합 — 아래 diagram/caption/structural 제외를 통과한 낱말).
     order_seq: dict[Any, list[str]] = {}
+    gate_page_errors: list[dict[str, Any]] = []
+    range_pages = (start, end)
 
     for pno in range(start, end + 1):
         page = doc[pno - 1]
-        words = _words(page)
-        bodies = _table_bodies(page)
-        image_boxes = _image_boxes(page)
-        page_tables = _page_tables(page)
+        scanned = (page_scan or {}).get(pno)
+        if scanned:
+            words = scanned["words"]
+            bodies = scanned["bodies"]
+        else:
+            words = _words(page)
+            bodies = _table_bodies(page, words=words)
+        image_boxes = _image_boxes(page, gate_page_errors)
+        cached = table_cache.get(pno) if table_cache is not None else None
+        page_tables = _page_tables(page, cached=cached, errors=gate_page_errors)
         legend_boxes = _diagram_legend_boxes(page, page_tables)
         note_subtables = _note_subtables(page, page_tables, legend_boxes)
         # G02i2 F5 gate_false_pass 보강(코치 독립 시험 T05, review 표본
@@ -1561,43 +1726,27 @@ def _note_word_gate(
                 return global_timeline[i - 1][1]
 
             if not has_note_signal:
-                # G02i2 F5 gate_false_pass 보강(코치 독립 시험 T05, review 표본
-                # 2024H1#p21#22): 이 밴드 자체엔 새 신호(①…·단가정의)가 없어도,
-                # 앞선 밴드에서 이미 주석이 시작된 그룹의 문장이 반·쪽 경계를
-                # 넘어 그대로 이어지는 순수한 "이어짐" 구간일 수 있다(예:
-                # "…SiroccoFan#2)" 뒤 다음 단 맨 위 "2대,모터(2HP),호스(Ø300),
-                # 투광기(400W)"). 새 신호가 없다는 이유만으로 밴드 전체를
-                # 건너뛰면 이미 시작된 그룹의 order_seq 가 그 자리에서 짧게
-                # 끊겨 실제로는 정상인 산출을 불일치로 오탐했다.
-                # "문장이 아직 안 끝났다"를 한국어 종결어미 추정 같은 약한
-                # 규칙으로 보지 않는다("…다음과 같다." 뒤에 콜론식 목록이
-                # 이어지는 경우(2024H1 p45#107) 등은 문장 종결형처럼 보여도
-                # 실제로는 이어진다 — 이 규칙으로는 반증됐다). 대신 지금까지
-                # 이 owner 로 모은 order_seq 가 그 그룹의 실제 산출(정답
-                # 낱말열, extract.py 결과)의 "정확한 앞부분"이면서 아직 그
-                # 산출을 다 못 채웠다면 — 즉 이 그룹은 진짜로 아직 할 말이
-                # 남아 있다는 뜻이므로 — 신호가 없어도 그대로 이어 처리한다.
-                # 이미 어긋난(딴 데서 새거나 잘린) owner 는 이 조건을 만족하지
-                # 못해 안전하게 건너뛴다(기존 동작 유지, 새 오탐 없음). 표지·
-                # 목차·색인은 owner 로 잡힐 그룹이 있어도 그 그룹의 산출은
-                # 이미 다 채워져 있어(prefix 가 곧 전체와 같아짐) 여전히
-                # 건너뛴다.
-                has_ongoing_owner = False
+                # K1: 밴드를 건너뛸지는 산출(_group_output_chars)과 무관한 원문
+                # 신호로만 정한다. 이 밴드가 다음 ■ 머리글·대분류 배너·표 시작·
+                # 분야 표지 뒤에 있으면 owner 없음. 그 밖의 신호 없는 밴드는
+                # 직전 owner 의 이어짐 — 단, 원문에서 이미 그 owner 의 주석
+                # 낱말을 모은 뒤에만(산출 prefix 가 아님).
+                if _band_source_ends_owner(band_words_pre, by0, bodies, hx0, hx1):
+                    continue
+                has_src_ongoing = False
                 for w in band_words_pre:
                     o = _owner_at((w[1] + w[3]) / 2.0)
                     gid = o.get("group_id") if o is not None else None
-                    seq = order_seq.get(gid) if gid is not None else None
-                    if not seq:
-                        continue
-                    g_obj = gmap_all.get(gid)
-                    if g_obj is None:
-                        continue
-                    src_so_far = "".join(_compact(x) for x in seq)
-                    out_full = _group_output_chars(g_obj)
-                    if src_so_far and len(src_so_far) < len(out_full) and out_full.startswith(src_so_far):
-                        has_ongoing_owner = True
+                    if gid is not None and order_seq.get(gid):
+                        has_src_ongoing = True
                         break
-                if not has_ongoing_owner:
+                    # K2: 범위 시작 전 그룹이 타임라인에 있으면 범위 안 이어짐으로 본다.
+                    if o is not None:
+                        gpage = o.get("pdf_page")
+                        if isinstance(gpage, int) and gpage < start:
+                            has_src_ongoing = True
+                            break
+                if not has_src_ongoing:
                     continue
 
             band_words = _align_subtable_row_words(band_words_pre, note_subtables)
@@ -1766,7 +1915,8 @@ def _note_word_gate(
                             pass
                         else:
                             duplicate.append(dict(item, keys=hits))
-    doc.close()
+    if own_doc:
+        doc.close()
 
     # G02i2 F5: notes_order_mismatch — 그룹마다 "원문 낱말열(읽기순서, 위에서
     # 도식·그림제목·배너·표머리글·쪽번호를 뺀 것)"과 "항목·주석표 텍스트를
@@ -1781,7 +1931,7 @@ def _note_word_gate(
         if g is None:
             continue
         src = "".join(_compact(w) for w in words_seq)
-        out = _group_output_chars(g)
+        out = _group_output_chars(g, pages=range_pages)
         if not src or src == out:
             continue
         sm = difflib.SequenceMatcher(None, src, out, autojunk=False)
@@ -1803,20 +1953,34 @@ def _note_word_gate(
             }
         )
 
-    # 코치 핫픽스 09-17(G02i2 review_round3 gate_false_pass 1·2): 주석이 있는데
-    # 원문 낱말열이 하나도 모이지 않은 그룹은 "검사 안 됨"이다 — group_id 가
-    # records 와 어긋나 타임라인에 오르지 못했거나, 밴드 판정 사각지대로 통째로
-    # 건너뛴 경우. 0(정상)으로 넘기지 않고 불일치로 센다. 쪽 범위(--pages)에
-    # 주석이 전부 들어오는 그룹만 본다(범위 밖에서 시작한 그룹의 오탐 방지).
+    # 주석이 있는데 원문 낱말열이 하나도 모이지 않은 그룹은 "검사 안 됨".
+    # K2: 범위 밖에서 시작한 그룹도 범위 안 이어짐이 있으면 검사한다.
+    # owner 를 못 잡으면 0 으로 넘기지 않고 불일치로 센다.
+    last_pre = None
+    pre_range = [
+        g
+        for g in groups
+        if isinstance(g.get("pdf_page"), int) and g["pdf_page"] < start
+    ]
+    if pre_range:
+        last_pre = max(
+            pre_range,
+            key=lambda g: (int(g["pdf_page"]), _HALF_RANK.get(g.get("page_half") or "C", 0)),
+        )
     for g in groups:
         gid = g.get("group_id")
-        note_pages = [n.get("pdf_page") for n in (g.get("notes") or []) if isinstance(n.get("pdf_page"), int)]
-        if not note_pages or min(note_pages) < start or max(note_pages) > end:
-            continue
         if "".join(_compact(w) for w in order_seq.get(gid, [])):
             continue
-        out = _group_output_chars(g)
-        if not out:
+        out_in_range = _group_output_chars(g, pages=range_pages)
+        note_pages = [n.get("pdf_page") for n in (g.get("notes") or []) if isinstance(n.get("pdf_page"), int)]
+        in_range_notes = [p for p in note_pages if start <= p <= end]
+        should_check = bool(in_range_notes) or bool(out_in_range)
+        if not should_check and last_pre is not None and g is last_pre:
+            should_check = True
+        if not should_check:
+            continue
+        out = out_in_range or _group_output_chars(g)
+        if not out and not should_check:
             continue
         order_mismatch.append(
             {
@@ -1824,7 +1988,7 @@ def _note_word_gate(
                 "src_pos": 0,
                 "out_pos": 0,
                 "src_context": "",
-                "out_context": out[:40],
+                "out_context": (out or "")[:40],
                 "reason": "unchecked: no source note words collected for this group",
             }
         )
@@ -1834,6 +1998,7 @@ def _note_word_gate(
         "notes_duplicate": duplicate,
         "notes_figure_text": figure_text,
         "notes_order_mismatch": order_mismatch,
+        "gate_page_errors": gate_page_errors,
     }
 
 
@@ -1841,6 +2006,7 @@ def check_conservation(
     pdf_path: str | Path,
     result: dict[str, Any],
     pages: tuple[int, int] | None = None,
+    table_cache: dict[int, list] | None = None,
 ) -> dict[str, Any]:
     pdf_path = Path(pdf_path)
     doc = fitz.open(pdf_path)
@@ -1876,11 +2042,15 @@ def check_conservation(
             for _ph, hx0, hx1 in _halves(page):
                 in_note = _end_in_note(_note_events(words_pre, hx0, hx1), in_note)
 
+    page_scan: dict[int, dict[str, Any]] = {}
     for pno in range(start, end + 1):
         page = doc[pno - 1]
         words = _words(page)
-        bodies = _table_bodies(page)
-        vlines = _vlines(page)
+        drawings = page.get_drawings()
+        hlines = _wide_h(page, drawings)
+        vlines = _vlines(page, drawings)
+        bodies = _table_bodies(page, words=words, hlines=hlines)
+        page_scan[pno] = {"words": words, "bodies": bodies}
         # G02i2 F5 gate_false_pass 보강과 같은 이유(반을 안 나누면 우연히 다른
         # 반의 머리글 행 y 와 겹치는 표 본문 낱말이 잘못 걸러진다) — 이 기존
         # 게이트도 반별로 나눠 적용한다.
@@ -2095,6 +2265,10 @@ def check_conservation(
         tot_ins += len(inserted_spaces)
         tot_unrec += len(unrecorded)
 
+    # N8: 주석 게이트. 같은 doc·쪽 스캔(words/bodies)을 재사용한다.
+    note_gate = _note_word_gate(
+        pdf_path, result, pages, table_cache=table_cache, doc=doc, page_scan=page_scan
+    )
     doc.close()
 
     # H2: 원문 낱말 -> raw 필드뿐 아니라 최종 필드(name·spec·price·labor_ratio·unit_norm)
@@ -2104,14 +2278,11 @@ def check_conservation(
     n_unresolved_inherit = len(gates["unresolved_inherit"])
     n_parse_mismatch = len(gates["parse_mismatch"])
     n_inherit_mismatch = len(gates["inherit_mismatch"])
-
-    # N8: 주석(【단가정의】) 영역 낱말 보존 게이트. 독립적으로 다시 연다(위에서
-    # 이미 닫은 doc 을 재사용하지 않는다).
-    note_gate = _note_word_gate(pdf_path, result, pages)
     n_notes_missing = len(note_gate["notes_missing"])
     n_notes_duplicate = len(note_gate["notes_duplicate"])
     n_notes_figure_text = len(note_gate["notes_figure_text"])
     n_notes_order_mismatch = len(note_gate["notes_order_mismatch"])
+    n_gate_page_errors = len(note_gate.get("gate_page_errors") or [])
 
     # G02i2 F5: pua_chars — records·subheaders·groups 어디에도 사용자 정의
     # 영역(PUA) 글자가 남아 있으면 안 된다(pass 조건).
@@ -2154,6 +2325,7 @@ def check_conservation(
             "notes_figure_text": n_notes_figure_text,
             "notes_order_mismatch": n_notes_order_mismatch,
             "pua_chars": n_pua_chars,
+            "gate_page_errors": n_gate_page_errors,
             "pass": tot_missing == 0
             and tot_dup == 0
             and tot_split == 0
@@ -2167,6 +2339,7 @@ def check_conservation(
             and n_notes_missing == 0
             and n_notes_duplicate == 0
             and n_notes_order_mismatch == 0
-            and n_pua_chars == 0,
+            and n_pua_chars == 0
+            and n_gate_page_errors == 0,
         },
     }
