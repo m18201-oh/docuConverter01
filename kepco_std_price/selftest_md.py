@@ -602,6 +602,93 @@ def run_all() -> Check:
                 md_c,
             )
 
+    # ---------- G05 D1: 짧은 단가가 공종코드 부분문자열일 때 첫 행을 버리지 않는다 ----------
+    # 2023H2 p172 EB019.19080 / 단가 908. 코드 낱말에 "908" 이 들어 있어도
+    # 단가 열 안에 같은 숫자가 있으면 규격 조각이 아니다.
+    from .extract import _price_word_complete
+
+    words_d1 = [
+        (66.6, 234.0, 135.24, 246.0, "EB019.19080"),
+        (154.2, 234.0, 244.2, 246.0, "스터드볼트 설치"),
+        (258.84, 234.0, 358.44, 246.0, "자동 D19, L=80㎜"),
+        (371.52, 234.0, 382.72, 246.0, "nr"),
+        (413.04, 234.0, 433.19, 246.0, "908"),
+        (481.08, 234.0, 504.31, 246.0, "50%"),
+    ]
+    price_col_d1 = (394.12, 451.21)
+    ok_d1 = _price_word_complete("908", words_d1, price_col_d1, 216.96, 253.52)
+    c.check(
+        "D1 short price substring of code stays if in price column",
+        ok_d1 is True,
+        f"got {ok_d1}",
+    )
+    words_spec_only = [
+        (258.84, 234.0, 358.44, 246.0, "CTC 600"),
+    ]
+    ok_spec = _price_word_complete("600", words_spec_only, price_col_d1, 216.96, 253.52)
+    c.check(
+        "D1 short number only in spec column still rejected",
+        ok_spec is False,
+        f"got {ok_spec}",
+    )
+
+    # ---------- G05 D2: 공백 없는 글자층 게이트 + 주석·제목 띄어쓰기 복원 ----------
+    from .extract import Span, _restore_spaces
+    from .spec import TEXT_LAYER_SPACE_RATIO_MIN, hangul_span_space_ratio
+
+    r_on = hangul_span_space_ratio(["이단가는철골공사시", "스터드볼트설치"])
+    r_off = hangul_span_space_ratio(["이 단가는 철골공사 시", "스터드볼트 설치"])
+    c.check(
+        "D2 no-space hangul ratio below threshold",
+        r_on < TEXT_LAYER_SPACE_RATIO_MIN,
+        f"ratio={r_on} min={TEXT_LAYER_SPACE_RATIO_MIN}",
+    )
+    c.check(
+        "D2 spaced hangul ratio above threshold",
+        r_off >= TEXT_LAYER_SPACE_RATIO_MIN,
+        f"ratio={r_off} min={TEXT_LAYER_SPACE_RATIO_MIN}",
+    )
+    # 「■EB***** 스터드볼트설치」 꼴: 글자 간격 6.6pt 에서만 공백.
+    title_chars = [
+        Span(75.24, 169.68, 82.55, 184.08, "E"),
+        Span(82.56, 169.68, 89.87, 184.08, "B"),
+        Span(90.60, 169.68, 95.26, 184.08, "*"),
+        Span(95.88, 169.68, 100.54, 184.08, "*"),
+        Span(101.16, 169.68, 105.82, 184.08, "*"),
+        Span(106.56, 169.68, 111.22, 184.08, "*"),
+        Span(111.84, 169.68, 116.50, 184.08, "*"),
+        Span(123.12, 169.68, 135.12, 184.08, "스"),
+        Span(135.72, 169.68, 147.72, 184.08, "터"),
+        Span(148.32, 169.68, 160.32, 184.08, "드"),
+        Span(160.92, 169.68, 172.92, 184.08, "볼"),
+        Span(173.52, 169.68, 185.52, 184.08, "트"),
+        Span(192.12, 169.68, 204.12, 184.08, "설"),
+        Span(204.72, 169.68, 216.72, 184.08, "치"),
+    ]
+    restored_header = _restore_spaces("EB***** 스터드볼트설치", title_chars)
+    c.check(
+        "D2 restore glued group title 스터드볼트설치",
+        restored_header == "EB***** 스터드볼트 설치",
+        restored_header,
+    )
+    note_chars = [
+        Span(68.64, 343.92, 80.64, 358.32, "①"),
+        Span(86.76, 343.92, 98.76, 358.32, "이"),
+        Span(103.92, 343.92, 115.92, 358.32, "단"),
+        Span(115.32, 343.92, 127.32, 358.32, "가"),
+        Span(126.72, 343.92, 138.72, 358.32, "는"),
+        Span(143.88, 343.92, 155.88, 358.32, "철"),
+        Span(155.28, 343.92, 167.28, 358.32, "골"),
+        Span(166.68, 343.92, 178.68, 358.32, "공"),
+        Span(178.08, 343.92, 190.08, 358.32, "사"),
+    ]
+    restored_note = _restore_spaces("①이단가는철골공사", note_chars)
+    c.check(
+        "D2 restore glued note 이단가는철골공사",
+        restored_note == "① 이 단가는 철골공사",
+        restored_note,
+    )
+
     # K3③: conservation.py 와 extract.py 의 PUA 숫자 대응표 키 집합이 같아야 한다.
     from .conservation import _PUA_DIGIT_MAP as _GATE_PUA
     from .extract import _PUA_DIGIT_MAP as _EXTRACT_PUA
