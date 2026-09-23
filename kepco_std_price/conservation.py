@@ -28,8 +28,10 @@ from .spec import (
     PUA_POINT_MAP as _PUA_POINT_MAP,
     PUA_SUPER_MAP as _PUA_SUPER_MAP,
     STAR_RE,
+    TEXT_LAYER_SPACE_RATIO_MIN,
     UNIT_NORM,
     VLINE_MIN_LEN_PT,
+    hangul_span_space_ratio,
     landscape_gutter_x,
 )
 
@@ -2145,6 +2147,7 @@ def check_conservation(
                 in_note = _end_in_note(_note_events(words_pre, hx0, hx1), in_note)
 
     page_scan: dict[int, dict[str, Any]] = {}
+    hangul_span_texts: list[str] = []
     for pno in range(start, end + 1):
         page = doc[pno - 1]
         words = _words(page)
@@ -2153,6 +2156,20 @@ def check_conservation(
         vlines = _vlines(page, drawings)
         bodies = _table_bodies(page, words=words, hlines=hlines)
         page_scan[pno] = {"words": words, "bodies": bodies}
+        d = page.get_text("dict")
+        blocks = d.get("blocks", []) if isinstance(d, dict) else []
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != 0:
+                continue
+            for line in b.get("lines", []):
+                if not isinstance(line, dict):
+                    continue
+                for s in line.get("spans", []):
+                    if not isinstance(s, dict):
+                        continue
+                    t = s.get("text") or ""
+                    if any("가" <= ch <= "힣" for ch in t):
+                        hangul_span_texts.append(t)
         # G02i2 F5 gate_false_pass 보강과 같은 이유(반을 안 나누면 우연히 다른
         # 반의 머리글 행 y 와 겹치는 표 본문 낱말이 잘못 걸러진다) — 이 기존
         # 게이트도 반별로 나눠 적용한다.
@@ -2397,6 +2414,9 @@ def check_conservation(
     n_field_x_order = len(field_x_order)
     n_table_shape = len(table_shape_warnings)
 
+    space_ratio = hangul_span_space_ratio(hangul_span_texts)
+    text_layer_no_spaces = space_ratio < TEXT_LAYER_SPACE_RATIO_MIN
+
     return {
         "half": result.get("half"),
         "pages": page_reports,
@@ -2417,6 +2437,11 @@ def check_conservation(
         "notes_figure_text": note_gate["notes_figure_text"],
         "notes_order_mismatch": note_gate["notes_order_mismatch"],
         "pua_chars": pua_hits,
+        "text_layer_no_spaces": {
+            "on": text_layer_no_spaces,
+            "ratio": round(space_ratio, 4),
+            "threshold": TEXT_LAYER_SPACE_RATIO_MIN,
+        },
         "totals": {
             "body_words": tot_body,
             "assigned": tot_assigned,
@@ -2440,6 +2465,9 @@ def check_conservation(
             "price_unparsed": n_price_unparsed,
             "field_x_order": n_field_x_order,
             "table_shape_warnings": n_table_shape,
+            "text_layer_space_ratio": round(space_ratio, 4),
+            "text_layer_no_spaces": text_layer_no_spaces,
+            "text_layer_space_ratio_min": TEXT_LAYER_SPACE_RATIO_MIN,
             "pass": tot_missing == 0
             and tot_dup == 0
             and tot_split == 0
