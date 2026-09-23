@@ -139,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
             f"table_shape_warnings={tot.get('table_shape_warnings')} "
             f"field_x_order={tot.get('field_x_order')} "
             f"gate_page_errors={tot.get('gate_page_errors')} "
+            f"text_layer_no_spaces={1 if tot.get('text_layer_no_spaces') else 0} "
+            f"text_layer_space_ratio={tot.get('text_layer_space_ratio')} "
             f"pass={tot.get('pass')}",
             flush=True,
         )

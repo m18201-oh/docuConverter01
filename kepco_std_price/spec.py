@@ -100,6 +100,24 @@ LANDSCAPE_GUTTER_BAND = (0.35, 0.65)
 LANDSCAPE_GUTTER_CENTER_TOL_PT = 120.0
 LANDSCAPE_WORD_GAP_MIN_PT = 18.0
 
+# 본문(표 밖 그룹 제목·【단가정의】 주석) 글자층의 공백 비율.
+# 한글이 들어 있는 dict 스팬의 (공백 수 / 글자 수).
+# 실측(전권, MalgunGothic 표 글자 포함): 2023H2 0.036, 5권 0.115~0.136.
+# 표 밖만: 2023H2 0.023, 5권 0.138~0.150. 한 쪽(p172): 2023H2 0.049, 2024H2 0.141.
+# 2023H2 본문은 Type3 라 공백 글리프가 없고, 5권 본문(휴먼명조)은 있다.
+# 표 안 MalgunGothic 은 판이 같아 비율을 뒤집지 않는다. 0.07 은 두 군집 사이.
+TEXT_LAYER_SPACE_RATIO_MIN = 0.07
+
+
+def hangul_span_space_ratio(texts: list[str]) -> float:
+    """한글이 들어 있는 스팬 문자열의 공백 비율. 빈 입력이면 1.0(게이트 꺼짐)."""
+    parts = [t for t in texts if t and any("가" <= c <= "힣" for c in t)]
+    n = sum(len(t) for t in parts)
+    if n == 0:
+        return 1.0
+    return sum(t.count(" ") for t in parts) / n
+
+
 # 수량산출 예시도 거리구간(0-150m, 50m~100m, L=70m～100m)
 DIST_RANGE_RE = re.compile(
     r"\d+(?:\.\d+)?\s*m\s*[~∼\-～]\s*\d+(?:\.\d+)?\s*m"

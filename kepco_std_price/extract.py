@@ -33,8 +33,10 @@ from .spec import (
     PUA_POINT_MAP as _PUA_POINT_MAP,
     PUA_SUPER_MAP as _PUA_SUPER_MAP,
     STAR_FIND,
+    TEXT_LAYER_SPACE_RATIO_MIN,
     UNIT_NORM,
     VLINE_MIN_LEN_PT,
+    hangul_span_space_ratio,
     landscape_gutter_x,
 )
 
@@ -379,6 +381,53 @@ def _join_chars_line(chars: list[Span]) -> str:
                 parts.append(c.text)
         prev = c
     return " ".join(p for p in parts if p.strip() != "" or p.isspace()).replace("  ", " ").strip()
+
+
+def _restore_spaces(text: str, chars: list[Span]) -> str:
+    """공백 없는 원문을 글자 x 간격으로 다시 이어 띄어쓰기를 복원한다.
+
+    표 칸(_join_chars_line)과 같은 임계값. 글자 좌표에서 compact 원문을
+    찾지 못하면 입력을 그대로 둔다(억지로 나누지 않음).
+    """
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return text or ""
+    ordered = sorted(
+        (c for c in chars if (c.text or "").strip() != ""),
+        key=lambda c: (round(c.yc, 1), c.x0),
+    )
+    blob_ns = re.sub(r"\s+", "", "".join(c.text for c in ordered))
+    pos = blob_ns.find(compact)
+    if pos < 0:
+        return text
+    acc = 0
+    start: int | None = None
+    end: int | None = None
+    for i, c in enumerate(ordered):
+        piece = re.sub(r"\s+", "", c.text)
+        nxt = acc + len(piece)
+        if start is None and nxt > pos:
+            start = i
+        if start is not None and nxt >= pos + len(compact):
+            end = i
+            break
+        acc = nxt
+    if start is None or end is None:
+        return text
+    picked = ordered[start : end + 1]
+    lines: list[list[Span]] = []
+    for s in sorted(picked, key=lambda z: (z.y0, z.x0)):
+        if not lines:
+            lines.append([s])
+            continue
+        prev_yc = sum(x.yc for x in lines[-1]) / len(lines[-1])
+        if abs(s.yc - prev_yc) <= max(4.0, (s.y1 - s.y0) * 0.45):
+            lines[-1].append(s)
+        else:
+            lines.append([s])
+    restored = [_join_chars_line(ln) for ln in lines]
+    out = " ".join(t for t in restored if t.strip())
+    return out if out else text
 
 
 def _text_in(spans: list[Span], x0: float, x1: float, y0: float, y1: float) -> str:
@@ -790,6 +839,10 @@ def _price_word_complete(
     if "," in price_tok or len(compact) >= 4:
         return True
     px0, px1 = price_col
+    # 공종코드(EB019.19080) 안에 짧은 단가(908)가 부분문자열로 들어 있어도
+    # 단가 열에 같은 숫자가 있으면 진짜 단가다. 열 밖 일치만 있으면 규격 조각.
+    in_col = False
+    out_col = False
     for wx0, wy0, wx1, wy1, t in words:
         yc = (wy0 + wy1) / 2
         if not (y0 - 0.5 < yc < y1 + 0.5):
@@ -800,7 +853,12 @@ def _price_word_complete(
         if price_tok not in wt and wt not in price_tok and compact not in wt.replace(",", "").replace(" ", ""):
             continue
         if wx0 >= px0 - 2.5 and wx1 <= px1 + 2.5:
-            return True
+            in_col = True
+        else:
+            out_col = True
+    if in_col:
+        return True
+    if out_col:
         return False
     return True
 
@@ -1530,6 +1588,8 @@ def extract_pdf(
     # last_group·last_colmap 과 같은 원리로, 새 ■ 그룹이 시작될 때만 끊는다(new_group 참고).
     last_sub: tuple[str, str] | None = None
     last_prev_name = ""
+    hangul_span_texts: list[str] = []
+    page_chars: dict[int, list[Span]] = {}
 
     # --pages 중간부터여도 앞쪽 배너를 읽어 대분류를 이어받는다
     if start > 1:
@@ -1556,6 +1616,10 @@ def extract_pdf(
             last_group = None
         spans_all = _page_spans(page)
         chars_all = _page_chars(page)
+        page_chars[pno] = chars_all
+        for s in spans_all:
+            if any("가" <= ch <= "힣" for ch in s.text):
+                hangul_span_texts.append(s.text)
         words_all = [
             (float(w[0]), float(w[1]), float(w[2]), float(w[3]), w[4])
             for w in page.get_text("words")
@@ -2285,6 +2349,14 @@ def extract_pdf(
     # G02i2 F1: 쪽·단 경계에서 잘려 항목 기호 없이 남은 이어짐 항목을, 그룹의
     # notes 가 문서 전체에 걸쳐 다 모인 뒤 한 번에 합친다(그룹별로 페이지 진행
     # 순서를 그대로 유지하는 groups 리스트 자체 순서를 바꾸지 않는다).
+    space_ratio = hangul_span_space_ratio(hangul_span_texts)
+    if space_ratio < TEXT_LAYER_SPACE_RATIO_MIN:
+        for g in groups:
+            g["header"] = _restore_spaces(g.get("header") or "", page_chars.get(int(g.get("pdf_page") or 0), []))
+            for n in g.get("notes") or []:
+                n["item"] = _restore_spaces(
+                    n.get("item") or "", page_chars.get(int(n.get("pdf_page") or 0), [])
+                )
     for g in groups:
         if g.get("notes"):
             g["notes"] = _merge_note_continuations(g["notes"])
