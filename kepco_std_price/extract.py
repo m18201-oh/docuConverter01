@@ -790,6 +790,10 @@ def _price_word_complete(
     if "," in price_tok or len(compact) >= 4:
         return True
     px0, px1 = price_col
+    # 공종코드(EB019.19080) 안에 짧은 단가(908)가 부분문자열로 들어 있어도
+    # 단가 열에 같은 숫자가 있으면 진짜 단가다. 열 밖 일치만 있으면 규격 조각.
+    in_col = False
+    out_col = False
     for wx0, wy0, wx1, wy1, t in words:
         yc = (wy0 + wy1) / 2
         if not (y0 - 0.5 < yc < y1 + 0.5):
@@ -800,7 +804,12 @@ def _price_word_complete(
         if price_tok not in wt and wt not in price_tok and compact not in wt.replace(",", "").replace(" ", ""):
             continue
         if wx0 >= px0 - 2.5 and wx1 <= px1 + 2.5:
-            return True
+            in_col = True
+        else:
+            out_col = True
+    if in_col:
+        return True
+    if out_col:
         return False
     return True
 
