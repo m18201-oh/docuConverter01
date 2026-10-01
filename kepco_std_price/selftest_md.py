@@ -174,6 +174,12 @@ def run_all() -> Check:
             c.check("S1 목록에 생성 시각 포함", bool(mdata.get("generated_at")))
         except Exception as e:  # noqa: BLE001
             c.check("S1 목록 JSON 파싱", False, str(e))
+        files_with_cr = [
+            str(p.relative_to(md_dir).as_posix())
+            for p in md_dir.rglob("*")
+            if p.is_file() and b"\r" in p.read_bytes()
+        ]
+        c.check("S1 출력 파일에 \\r 없음(LF 통일)", len(files_with_cr) == 0, str(files_with_cr))
 
     # ---------- S2: 같은 입력 재실행 ----------
     with tempfile.TemporaryDirectory(prefix="g02g_s2_") as tmp:

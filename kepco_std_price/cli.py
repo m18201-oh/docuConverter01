@@ -23,7 +23,7 @@ def _parse_pages(s: str | None) -> tuple[int, int] | None:
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    with path.open("w", encoding="utf-8", newline="\n") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         (out / "conservation.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2),
             encoding="utf-8",
+            newline="\n",
         )
         tot = report.get("totals") or {}
         print(
