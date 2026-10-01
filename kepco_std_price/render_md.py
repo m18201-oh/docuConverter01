@@ -686,6 +686,7 @@ def render_md(
     (md_dir / MANIFEST_NAME).write_text(
         json.dumps(manifest_out, ensure_ascii=False, indent=2),
         encoding="utf-8",
+        newline="\n",
     )
 
     return summary
