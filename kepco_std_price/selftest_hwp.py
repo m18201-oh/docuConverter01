@@ -190,6 +190,51 @@ def make_xml() -> bytes:
     return xml.encode("utf-8")
 
 
+def _ts_header() -> str:
+    return _row(
+        0,
+        [
+            (0, "공종코드"),
+            (1, "공종명칭"),
+            (2, "규격"),
+            (3, "단위"),
+            (4, "단가"),
+            (5, "노무비율"),
+        ],
+    )
+
+
+def _ts_rec(row: int, code: str, name: str) -> str:
+    return _row(
+        row,
+        [
+            (0, code),
+            (1, name),
+            (2, "-"),
+            (3, "m"),
+            (4, "1,000"),
+            (5, "10.00%"),
+        ],
+    )
+
+
+def make_xml_table_seq(body: str) -> bytes:
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<HwpDoc version="5.1.1.0">
+  <BodyText>
+    <SectionDef section-id="0">
+      <PageDef width="59528" height="84188" orientation="portrait"/>
+      <ColumnSet>
+        {_text_para("토목분야 자체 표준시장단가")}
+        {body}
+      </ColumnSet>
+    </SectionDef>
+  </BodyText>
+</HwpDoc>
+"""
+    return xml.encode("utf-8")
+
+
 class Check:
     def __init__(self) -> None:
         self.results: list[tuple[str, bool, str]] = []
@@ -390,6 +435,88 @@ def run_all() -> Check:
         bool(notes_lat) and "수량산출 예" in notes_lat[-1] and not any(x.startswith("(표)") for x in notes_lat),
         str(notes_lat),
     )
+
+    def _g_seqs(result: dict, gidx: int = 0) -> tuple[list, list]:
+        g = result["groups"][gidx]
+        gid = g["group_id"]
+        recs = [r["table_seq"] for r in result["records"] if r["group_id"] == gid]
+        notes = [n.get("table_seq") for n in (g.get("notes") or [])]
+        return recs, notes
+
+    hdr = _ts_header()
+    body_ga_da = (
+        f"{_text_para('■ TS01* 가')}"
+        f"{_table([hdr, _ts_rec(1, 'TS010.10000', '가1')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 가1에 적용한다.')}"
+        f"{_text_para('② 이 단가는 가2에 적용한다.')}"
+        f"{_table([hdr, _ts_rec(1, 'TS010.20000', '가2')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 가3에 적용한다.')}"
+        f"{_text_para('■ TS02* 다')}"
+        f"{_table([hdr, _ts_rec(1, 'TS020.10000', '다1')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 다에 적용한다.')}"
+    )
+    res_ga = extract_from_root(etree.fromstring(make_xml_table_seq(body_ga_da)), "2026H1", sha="ts")
+    rec_ga, note_ga = _g_seqs(res_ga, 0)
+    rec_da, note_da = _g_seqs(res_ga, 1)
+    c.check("TS가 레코드 1,2 / 주석 1,1,2", rec_ga == [1, 2] and note_ga == [1, 1, 2], str((rec_ga, note_ga)))
+    c.check("TS다 새 그룹은 다시 1", rec_da == [1] and note_da == [1], str((rec_da, note_da)))
+
+    body_na = (
+        f"{_text_para('■ TS03* 나')}"
+        f"{_table([hdr, _ts_rec(1, 'TS030.10000', '나1')])}"
+        f"{_table([hdr, _ts_rec(1, 'TS030.20000', '나2')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 나1에 적용한다.')}"
+        f"{_text_para('② 이 단가는 나2에 적용한다.')}"
+    )
+    res_na = extract_from_root(etree.fromstring(make_xml_table_seq(body_na)), "2026H1", sha="ts")
+    rec_na, note_na = _g_seqs(res_na, 0)
+    c.check("TS나 레코드·주석 전부 1", rec_na == [1, 1] and note_na == [1, 1], str((rec_na, note_na)))
+
+    body_ra = (
+        f"{_text_para('■ TS04* 라')}"
+        f"{_table([hdr, _ts_rec(1, 'TS040.10000', '라1')])}"
+        f"{_text_para('① 이 단가는 라에 적용한다.')}"
+        f"{_table([hdr, _ts_rec(1, 'TS040.20000', '라2')])}"
+    )
+    res_ra = extract_from_root(etree.fromstring(make_xml_table_seq(body_ra)), "2026H1", sha="ts")
+    rec_ra, note_ra = _g_seqs(res_ra, 0)
+    c.check("TS라 라벨 없이 ① → 레코드 1,2 / 주석 1", rec_ra == [1, 2] and note_ra == [1], str((rec_ra, note_ra)))
+
+    body_ma = (
+        f"{_text_para('■ TS05* 마')}"
+        f"{_table([hdr, _ts_rec(1, 'TS050.10000', '마1')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 마1에 적용한다.')}"
+        f"{_table([hdr, _ts_rec(1, 'TS050.20000', '마2')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('※ 이 단가는 마2에 적용한다.')}"
+    )
+    res_ma = extract_from_root(etree.fromstring(make_xml_table_seq(body_ma)), "2026H1", sha="ts")
+    rec_ma, note_ma = _g_seqs(res_ma, 0)
+    c.check("TS마 ※ 주석 → 레코드 1,2 / 주석 1,2", rec_ma == [1, 2] and note_ma == [1, 2], str((rec_ma, note_ma)))
+
+    body_ba = (
+        f"{_text_para('■ TS06* 바')}"
+        f"{_table([hdr, _ts_rec(1, 'TS060.10000', '바1')])}"
+        f"{_table([hdr, _ts_rec(1, 'TS060.20000', '바2')])}"
+    )
+    res_ba = extract_from_root(etree.fromstring(make_xml_table_seq(body_ba)), "2026H1", sha="ts")
+    rec_ba, note_ba = _g_seqs(res_ba, 0)
+    c.check("TS바 주석 없음 → 레코드 전부 1", rec_ba == [1, 1] and note_ba == [], str((rec_ba, note_ba)))
+
+    body_sa = (
+        f"{_text_para('■ TS07* 사')}"
+        f"{_table([hdr, _ts_rec(1, 'TS070.10000', '사1')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_table([hdr, _ts_rec(1, 'TS070.20000', '사2')])}"
+    )
+    res_sa = extract_from_root(etree.fromstring(make_xml_table_seq(body_sa)), "2026H1", sha="ts")
+    rec_sa, note_sa = _g_seqs(res_sa, 0)
+    c.check("TS사 라벨만 → 레코드 1,2 / 주석 없음", rec_sa == [1, 2] and note_sa == [], str((rec_sa, note_sa)))
 
     return c
 

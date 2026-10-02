@@ -13,6 +13,7 @@ from pathlib import Path
 from lxml import etree
 
 from .extract import ValidationError
+from .table_seq import TableSeq
 from .spec import (
     BANNER_RE,
     BANNER_TRAIL_RE,
@@ -498,12 +499,16 @@ def extract_from_root(
     note_lines: list[str] = []
     group_seq = 0
     table_index = 0
+    table_seq = TableSeq()
 
     def flush_notes() -> None:
         nonlocal in_notes, note_lines
         if last_group is not None and note_lines:
             items = _note_items(note_lines)
             if items:
+                gid = last_group.get("group_id")
+                for it in items:
+                    it["table_seq"] = table_seq.note_seen(gid)
                 last_group["notes"].extend(items)
         note_lines = []
         in_notes = False
@@ -539,6 +544,7 @@ def extract_from_root(
         }
         groups.append(g)
         last_group = g
+        table_seq.start(gid)
         return g
 
     def add_figure(caption: str) -> None:
@@ -683,6 +689,8 @@ def extract_from_root(
                 if not raw_keep:
                     continue
 
+            gid = grp["group_id"] if grp else None
+            seq = table_seq.record(gid)
             rec = {
                 "key": f"{code}@{half}",
                 "code": code,
@@ -692,7 +700,8 @@ def extract_from_root(
                 "pdf_page": None,
                 "page_half": None,
                 "printed_page": None,
-                "group_id": grp["group_id"] if grp else None,
+                "group_id": gid,
+                "table_seq": seq,
                 "name_group": name_group if inherited or name_group else None,
                 "bbox": None,
                 "name_raw": name_raw,
@@ -795,6 +804,7 @@ def extract_from_root(
                 continue
             if _is_danga_label(text_s):
                 in_notes = True
+                table_seq.note_seen(last_group["group_id"] if last_group else None)
                 continue
             if last_group is not None and not in_notes and text_s and (
                 text_s[0] in CIRCLED or text_s.startswith("※")

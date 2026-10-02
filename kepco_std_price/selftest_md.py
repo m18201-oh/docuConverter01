@@ -739,6 +739,47 @@ def run_all() -> Check:
         code = cli_main(["--pdf", str(missing), "--half", "2025H2", "--out", str(out_dir)])
         c.check("L8 CLI missing exit 2", code == 2, str(code))
 
+    # ---------- table_seq 단위 사례 (G07) ----------
+    from .table_seq import TableSeq
+
+    ts = TableSeq()
+    ts.start("가")
+    t1_r1 = ts.record("가")
+    t1_r2 = ts.record("가")
+    ts.note_seen("가")
+    t1_r3 = ts.record("가")
+    c.check("T1 start-record-record-note-record → 1,1,2", (t1_r1, t1_r2, t1_r3) == (1, 1, 2), str((t1_r1, t1_r2, t1_r3)))
+
+    ts = TableSeq()
+    ts.start("가")
+    t2_r1 = ts.record("가")
+    t2_n1 = ts.note_seen("가")
+    t2_n2 = ts.note_seen("가")
+    t2_r2 = ts.record("가")
+    c.check(
+        "T2 겹친 신호는 한 번만 오른다",
+        (t2_r1, t2_r2) == (1, 2) and t2_n1 == 1 and t2_n2 == 1,
+        str((t2_r1, t2_n1, t2_n2, t2_r2)),
+    )
+
+    ts = TableSeq()
+    ts.start("가")
+    t3_n = ts.note_seen("가")
+    t3_r = ts.record("가")
+    c.check("T3 주석이 레코드보다 먼저 → 1,1", t3_n == 1 and t3_r == 1, str((t3_n, t3_r)))
+
+    ts = TableSeq()
+    ts.start("가")
+    t4_ga1 = ts.record("가")
+    ts.note_seen("가")
+    ts.start("나")
+    t4_na = ts.record("나")
+    t4_ga2 = ts.record("가")
+    c.check("T4 그룹끼리 섞이지 않는다", (t4_ga1, t4_na, t4_ga2) == (1, 1, 2), str((t4_ga1, t4_na, t4_ga2)))
+
+    ts = TableSeq()
+    c.check("T5 record(None)·note_seen(None) 은 None", ts.record(None) is None and ts.note_seen(None) is None)
+
     return c
 
 
