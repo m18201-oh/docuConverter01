@@ -13,6 +13,7 @@ from pathlib import Path
 import pymupdf as fitz
 
 from .conservation import snapshot_page_tables
+from .table_seq import TableSeq
 from .spec import (
     BANNER_RE,
     BANNER_TRAIL_RE,
@@ -1590,6 +1591,7 @@ def extract_pdf(
     last_prev_name = ""
     hangul_span_texts: list[str] = []
     page_chars: dict[int, list[Span]] = {}
+    table_seq = TableSeq()
 
     # --pages 중간부터여도 앞쪽 배너를 읽어 대분류를 이어받는다
     if start > 1:
@@ -1755,6 +1757,7 @@ def extract_pdf(
                 }
                 groups.append(g)
                 last_group = g
+                table_seq.start(gid)
                 return g
 
             def attach_notes_from(y0: float, y1: float, grp: dict | None) -> None:
@@ -1948,7 +1951,12 @@ def extract_pdf(
                     grp.setdefault("figures", [])
                     for cap in caps:
                         grp["figures"].append({"caption": cap, "pdf_page": pno})
-                grp["notes"].extend(_note_items(kept_lines, pno))
+                items = _note_items(kept_lines, pno)
+                if items:
+                    gid = grp.get("group_id")
+                    for it in items:
+                        it["table_seq"] = table_seq.note_seen(gid)
+                    grp["notes"].extend(items)
 
             # 쪽 넘김으로 그룹을 끝내지 않음: 첫머리 주석(⑤부터, 【단가정의】 없이 ①)을 이전 그룹에
             first_group_y = min((e[0] for e in events if e[1] == "group"), default=None)
@@ -2244,6 +2252,8 @@ def extract_pdf(
                         ):
                             continue
 
+                        gid = grp["group_id"] if grp else None
+                        seq = table_seq.record(gid)
                         rec = {
                             "key": f"{code}@{half}",
                             "code": code,
@@ -2253,7 +2263,8 @@ def extract_pdf(
                             "pdf_page": pno,
                             "page_half": ph,
                             "printed_page": printed,
-                            "group_id": grp["group_id"] if grp else None,
+                            "group_id": gid,
+                            "table_seq": seq,
                             "name_group": name_group if inherited or name_group else None,
                             "bbox": [
                                 round(table_x0, 1),
@@ -2328,6 +2339,7 @@ def extract_pdf(
 
                 elif etype == "notes":
                     grp = current_group or last_group
+                    table_seq.note_seen(grp["group_id"] if grp else None)
                     attach_notes_from(ey - 2, _header_row_trim(ey, next_y, headers), grp)
 
             # page-top notes without 단가정의 keyword already handled if dangas exist.
