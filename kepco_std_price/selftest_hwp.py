@@ -55,6 +55,31 @@ def _table(rows: list[str]) -> str:
     )
 
 
+def _table_control(rows: list[str]) -> str:
+    body = "<TableBody rows='{n}' cols='6'>".replace("{n}", str(len(rows))) + "".join(rows) + "</TableBody>"
+    return "<TableControl chid='tbl '>" + body + "</TableControl>"
+
+
+def _diagram_control() -> str:
+    return (
+        "<TableControl chid='tbl '>"
+        "<TableBody rows='1' cols='1'>"
+        "<TableRow>"
+        + _cell(0, 0, "시공기준면")
+        + "</TableRow></TableBody></TableControl>"
+    )
+
+
+def _mixed_para(*chunks: str) -> str:
+    inner: list[str] = []
+    for ch in chunks:
+        if ch.startswith("<TableControl"):
+            inner.append(ch)
+        else:
+            inner.append(f'<Text charshape-id="1" lang="ko">{ch}</Text>')
+    return "<Paragraph><LineSeg>" + "".join(inner) + "</LineSeg></Paragraph>"
+
+
 def make_xml() -> bytes:
     header = _row(
         0,
@@ -517,6 +542,51 @@ def run_all() -> Check:
     res_sa = extract_from_root(etree.fromstring(make_xml_table_seq(body_sa)), "2026H1", sha="ts")
     rec_sa, note_sa = _g_seqs(res_sa, 0)
     c.check("TS사 라벨만 → 레코드 1,2 / 주석 없음", rec_sa == [1, 2] and note_sa == [], str((rec_sa, note_sa)))
+
+    body_ga1 = (
+        f"{_text_para('■ NA20* 수직구 / 토사굴착')}"
+        f"{_table([hdr, _ts_rec(1, 'NA200.10000', '토사굴착')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 수직구 토사굴착에 적용한다.')}"
+        f"{_text_para('② 이 단가는 수직구 토사굴착에 적용한다.')}"
+        f"{_mixed_para('③ 본 단가의 적용을 위한 수량 산출은 아래와 같다.', _diagram_control())}"
+    )
+    res_ga1 = extract_from_root(etree.fromstring(make_xml_table_seq(body_ga1)), "2026H1", sha="g08a")
+    notes_ga1 = [n.get("item") or "" for n in (res_ga1["groups"][0].get("notes") or [])]
+    c.check(
+        "가1 표와 같은 문단의 ③이 빠지지 않는다",
+        len(notes_ga1) == 3 and notes_ga1[2].startswith("③"),
+        str(notes_ga1),
+    )
+
+    body_ga2 = (
+        f"{_text_para('■ DK32* 소나무 식재')}"
+        f"{_mixed_para(_table_control([hdr, _ts_rec(1, 'DK320.10000', '소나무1')]), '【단가정의】')}"
+        f"{_text_para('① 이 단가는 소나무 식재에 적용한다.')}"
+        f"{_table([hdr, _ts_rec(1, 'DK320.20000', '소나무2')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 소나무 식재에 적용한다.')}"
+    )
+    res_ga2 = extract_from_root(etree.fromstring(make_xml_table_seq(body_ga2)), "2026H1", sha="g08a")
+    rec_ga2, note_ga2 = _g_seqs(res_ga2, 0)
+    c.check(
+        "가2 표 뒤 【단가정의】 → 레코드 1,2 / 주석 1,2",
+        rec_ga2 == [1, 2] and note_ga2 == [1, 2],
+        str((rec_ga2, note_ga2)),
+    )
+
+    body_ga3 = (
+        f"{_text_para('■ XX10* 글이 표보다 앞')}"
+        f"{_mixed_para('① 이 단가는 글이 표보다 앞에 있을 때 적용한다.', _table_control([hdr, _ts_rec(1, 'XX100.10000', '앞글')]))}"
+    )
+    res_ga3 = extract_from_root(etree.fromstring(make_xml_table_seq(body_ga3)), "2026H1", sha="g08a")
+    rec_ga3, note_ga3 = _g_seqs(res_ga3, 0)
+    notes_ga3 = [n.get("item") or "" for n in (res_ga3["groups"][0].get("notes") or [])]
+    c.check(
+        "가3 글이 표보다 앞 → 주석 ①, 레코드 table_seq 1",
+        rec_ga3 == [1] and note_ga3 == [1] and bool(notes_ga3) and notes_ga3[0].startswith("①"),
+        str((rec_ga3, note_ga3, notes_ga3)),
+    )
 
     return c
 

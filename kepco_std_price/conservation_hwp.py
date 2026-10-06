@@ -107,6 +107,49 @@ def _top_controls(para: etree._Element, tag: str) -> list[etree._Element]:
     return out
 
 
+def _nested_in_cell(el: etree._Element, para: etree._Element) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag == "TableCell":
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _inside_tags(el: etree._Element, para: etree._Element, tags: tuple[str, ...]) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag in tags:
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _para_text_table_events(para: etree._Element) -> list[tuple[str, object]]:
+    """글 조각과 표(글상자 안 표 포함)를 XML 문서 순서로 낸다."""
+    events: list[tuple[str, object]] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            events.append(("text", "".join(buf)))
+            buf.clear()
+
+    for n in para.iter():
+        if n is para:
+            continue
+        if n.tag == "TableControl" and not _nested_in_cell(n, para):
+            flush()
+            events.append(("table", n))
+            continue
+        if _inside_tags(n, para, _STOP):
+            continue
+        if n.tag == "Text" and n.text:
+            buf.append(n.text)
+    flush()
+    return events
+
+
 def _table_rows(tbl: etree._Element) -> list[list[dict]]:
     body = tbl.find("TableBody")
     if body is None:
@@ -522,6 +565,25 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
                 best_p = p
         return best
 
+    def _absorb_note_text(text: str, para_index: int) -> None:
+        nonlocal in_notes, active_gid
+        if not text:
+            return
+        if _is_figure_caption(text):
+            gid = active_gid or _gid_for_para(para_index)
+            if gid:
+                src_notes.setdefault(gid, []).extend(w for w in _tokenize(text) if not _skip_note_word(w))
+            return
+        if text.startswith("■") or _is_danga_label(text):
+            return
+        if last_gid and not in_notes and text and (text[0] in CIRCLED or text.startswith("※")):
+            in_notes = True
+            active_gid = _gid_for_para(para_index)
+        if in_notes:
+            gid = active_gid or _gid_for_para(para_index)
+            if gid:
+                src_notes.setdefault(gid, []).extend(w for w in _tokenize(text) if not _skip_note_word(w))
+
     for section in sections:
         colset = section.find("ColumnSet")
         paras = list(colset) if colset is not None else [p for p in section if p.tag == "Paragraph"]
@@ -538,7 +600,8 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
             if _is_danga_label(text):
                 in_notes = True
                 active_gid = _gid_for_para(para_index)
-                continue
+                if not tables:
+                    continue
             compact_line = re.sub(r"\s+", "", text)
             if compact_line and (
                 re.fullmatch(r"[가-힣·ㆍ‧･․]{2,12}분야", compact_line)
@@ -657,7 +720,14 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
                                     for w in _tokenize(node)
                                     if not _skip_note_word(w)
                                 )
+            mixed_texts = [
+                str(payload).strip()
+                for kind, payload in (_para_text_table_events(para) if tables else [])
+                if kind == "text"
+            ]
             if ended:
+                for t in mixed_texts:
+                    _absorb_note_text(t, para_index)
                 continue
 
             for shp in shapes:
@@ -671,6 +741,8 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
                         notes_figure_text.append({"text": w, "para_index": para_index})
 
             if tables:
+                for t in mixed_texts:
+                    _absorb_note_text(t, para_index)
                 continue
             if not text:
                 continue

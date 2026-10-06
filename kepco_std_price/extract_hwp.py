@@ -131,6 +131,49 @@ def _top_controls(para: etree._Element, tag: str) -> list[etree._Element]:
     return out
 
 
+def _nested_in_cell(el: etree._Element, para: etree._Element) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag == "TableCell":
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _inside_tags(el: etree._Element, para: etree._Element, tags: tuple[str, ...]) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag in tags:
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _para_text_table_events(para: etree._Element) -> list[tuple[str, object]]:
+    """글 조각과 표(글상자 안 표 포함)를 XML 문서 순서로 낸다."""
+    events: list[tuple[str, object]] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            events.append(("text", "".join(buf)))
+            buf.clear()
+
+    for n in para.iter():
+        if n is para:
+            continue
+        if n.tag == "TableControl" and not _nested_in_cell(n, para):
+            flush()
+            events.append(("table", n))
+            continue
+        if _inside_tags(n, para, _STOP):
+            continue
+        if n.tag == "Text" and n.text:
+            buf.append(_fix_pua(n.text))
+    flush()
+    return events
+
+
 def _table_rows(tbl: etree._Element) -> list[list[dict]]:
     body = tbl.find("TableBody")
     if body is None:
@@ -738,6 +781,57 @@ def extract_from_root(
         last_sub = current_sub
         last_prev_name = prev_name
 
+    def handle_one_table(tbl: etree._Element, section_id: int, para_index: int) -> None:
+        nonlocal table_index, in_notes, last_major, last_major_name
+        table_index += 1
+        rows = _table_rows(tbl)
+        if not rows:
+            return
+        if _is_record_header(rows[0]):
+            handle_record_table(rows, section_id, para_index, table_index)
+            return
+        banner = _parse_banner(rows[0]) if len(rows) == 1 else None
+        if banner:
+            flush_notes()
+            last_major, last_major_name = banner
+            return
+        if in_notes or (last_group is not None and not _is_diagram_table(rows)):
+            if _is_diagram_table(rows):
+                return
+            flat = _flatten_subtable(rows)
+            if flat:
+                if not in_notes:
+                    in_notes = True
+                note_lines.append(flat)
+        # 그 외(목차·표지 표)는 버린다
+
+    def handle_para_text(text_s: str, section_id: int, para_index: int) -> None:
+        nonlocal in_notes
+        if not text_s:
+            return
+        if _is_figure_caption(text_s):
+            add_figure(text_s)
+            return
+        if text_s.startswith("■"):
+            new_group(text_s, section_id, para_index)
+            return
+        if _is_danga_label(text_s):
+            in_notes = True
+            table_seq.note_seen(last_group["group_id"] if last_group else None)
+            return
+        if last_group is not None and not in_notes and text_s and (
+            text_s[0] in CIRCLED or text_s.startswith("※")
+        ):
+            in_notes = True
+        if in_notes:
+            note_lines.append(text_s)
+
+    def handle_shapes(shapes: list[etree._Element]) -> None:
+        for shp in shapes:
+            cap = _texts_under(shp, stop=("TableControl",)).strip()
+            if _is_figure_caption(cap):
+                add_figure(cap)
+
     for sec_i, section in enumerate(sections):
         section_id = int(section.get("section-id") or sec_i)
         page_def = section.find("PageDef")
@@ -763,55 +857,16 @@ def extract_from_root(
                     last_major_name = ""
                 last_field = field_hit
 
-            for tbl in tables:
-                table_index += 1
-                rows = _table_rows(tbl)
-                if not rows:
-                    continue
-                if _is_record_header(rows[0]):
-                    handle_record_table(rows, section_id, para_index, table_index)
-                    continue
-                banner = _parse_banner(rows[0]) if len(rows) == 1 else None
-                if banner:
-                    flush_notes()
-                    last_major, last_major_name = banner
-                    continue
-                if in_notes or (last_group is not None and not _is_diagram_table(rows)):
-                    if _is_diagram_table(rows):
-                        continue
-                    flat = _flatten_subtable(rows)
-                    if flat:
-                        if not in_notes:
-                            in_notes = True
-                        note_lines.append(flat)
-                # 그 외(목차·표지 표)는 버린다
-
-            for shp in shapes:
-                cap = _texts_under(shp, stop=("TableControl",)).strip()
-                if _is_figure_caption(cap):
-                    add_figure(cap)
-
             if tables:
-                continue
-
-            if not text_s:
-                continue
-            if _is_figure_caption(text_s):
-                add_figure(text_s)
-                continue
-            if text_s.startswith("■"):
-                new_group(text_s, section_id, para_index)
-                continue
-            if _is_danga_label(text_s):
-                in_notes = True
-                table_seq.note_seen(last_group["group_id"] if last_group else None)
-                continue
-            if last_group is not None and not in_notes and text_s and (
-                text_s[0] in CIRCLED or text_s.startswith("※")
-            ):
-                in_notes = True
-            if in_notes:
-                note_lines.append(text_s)
+                for kind, payload in _para_text_table_events(para):
+                    if kind == "table":
+                        handle_one_table(payload, section_id, para_index)
+                    else:
+                        handle_para_text(str(payload).strip(), section_id, para_index)
+                handle_shapes(shapes)
+            else:
+                handle_shapes(shapes)
+                handle_para_text(text_s, section_id, para_index)
 
         pages_out.append(
             {
