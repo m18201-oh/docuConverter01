@@ -32,9 +32,22 @@ from .spec import (
 _STOP = ("TableControl", "GShapeObjectControl")
 _PUA_RE = re.compile(r"[\ue000-\uf8ff]")
 FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야(?:자체표준시장단가)?")
+_SUPER_TRANS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
-def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
+def _eq_text(script: str) -> str:
+    s = script.replace("`", "")
+    s = s.replace("~", " ")
+    s = re.sub(r"(?<![A-Za-z])\s*TIMES\s*(?![A-Za-z])", "×", s)
+    s = re.sub(r"\s*\^\{(\d+)\}", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r"\s*\^(\d+)", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r" {2,}", " ", s).strip()
+    if re.search(r"[{}^_#&]", s) or re.search(r"[A-Za-z]{2,}", s):
+        return re.sub(r" {2,}", " ", script).strip()
+    return s
+
+
+def _hwp_to_root(hwp_path: str | Path, warnings: list[str] | None = None) -> etree._Element:
     try:
         from hwp5.xmlmodel import Hwp5File
     except ImportError as e:
@@ -44,7 +57,30 @@ def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
         buf = io.BytesIO()
         hwp.xmlevents().dump(buf)
         buf.seek(0)
-        return etree.parse(buf).getroot()
+        root = etree.parse(buf).getroot()
+        scripts: list[str] = []
+        for i in hwp.bodytext.section_indexes():
+            for rec in hwp.bodytext.section(i).records():
+                tag = rec.get("tagname") if isinstance(rec, dict) else getattr(rec, "tagname", "")
+                if "EQEDIT" not in str(tag or ""):
+                    continue
+                payload = rec.get("payload") if isinstance(rec, dict) else getattr(rec, "payload", b"")
+                if not isinstance(payload, (bytes, bytearray)) or len(payload) < 6:
+                    scripts.append("")
+                    continue
+                nchars = int.from_bytes(payload[4:6], "little")
+                raw = bytes(payload)[6 : 6 + nchars * 2]
+                scripts.append(raw.decode("utf-16le", errors="replace"))
+        eqs = list(root.iter("EqEdit"))
+        if len(scripts) != len(eqs):
+            if warnings is not None:
+                warnings.append(
+                    f"수식 레코드 수({len(scripts)})와 EqEdit 수({len(eqs)})가 달라 수식을 붙이지 않습니다"
+                )
+        else:
+            for el, script in zip(eqs, scripts):
+                el.set("script", script)
+        return root
     finally:
         close = getattr(hwp, "close", None)
         if callable(close):
@@ -61,6 +97,10 @@ def _texts_under(el: etree._Element, stop: tuple[str, ...] = _STOP) -> str:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             parts.append(n.text)
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                parts.append(_eq_text(script))
         for ch in n:
             if ch.tag in stop:
                 continue
@@ -76,6 +116,10 @@ def _text_nodes(el: etree._Element) -> list[str]:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             out.append(n.text)
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                out.append(_eq_text(script))
         for ch in n:
             if ch.tag in _STOP:
                 continue
@@ -105,6 +149,53 @@ def _top_controls(para: etree._Element, tag: str) -> list[etree._Element]:
         if not nested:
             out.append(el)
     return out
+
+
+def _nested_in_cell(el: etree._Element, para: etree._Element) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag == "TableCell":
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _inside_tags(el: etree._Element, para: etree._Element, tags: tuple[str, ...]) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag in tags:
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _para_text_table_events(para: etree._Element) -> list[tuple[str, object]]:
+    """글 조각과 표(글상자 안 표 포함)를 XML 문서 순서로 낸다."""
+    events: list[tuple[str, object]] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            events.append(("text", "".join(buf)))
+            buf.clear()
+
+    for n in para.iter():
+        if n is para:
+            continue
+        if n.tag == "TableControl" and not _nested_in_cell(n, para):
+            flush()
+            events.append(("table", n))
+            continue
+        if _inside_tags(n, para, _STOP):
+            continue
+        if n.tag == "Text" and n.text:
+            buf.append(n.text)
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                buf.append(_eq_text(script))
+    flush()
+    return events
 
 
 def _table_rows(tbl: etree._Element) -> list[list[dict]]:
@@ -522,6 +613,25 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
                 best_p = p
         return best
 
+    def _absorb_note_text(text: str, para_index: int) -> None:
+        nonlocal in_notes, active_gid
+        if not text:
+            return
+        if _is_figure_caption(text):
+            gid = active_gid or _gid_for_para(para_index)
+            if gid:
+                src_notes.setdefault(gid, []).extend(w for w in _tokenize(text) if not _skip_note_word(w))
+            return
+        if text.startswith("■") or _is_danga_label(text):
+            return
+        if last_gid and not in_notes and text and (text[0] in CIRCLED or text.startswith("※")):
+            in_notes = True
+            active_gid = _gid_for_para(para_index)
+        if in_notes:
+            gid = active_gid or _gid_for_para(para_index)
+            if gid:
+                src_notes.setdefault(gid, []).extend(w for w in _tokenize(text) if not _skip_note_word(w))
+
     for section in sections:
         colset = section.find("ColumnSet")
         paras = list(colset) if colset is not None else [p for p in section if p.tag == "Paragraph"]
@@ -538,7 +648,8 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
             if _is_danga_label(text):
                 in_notes = True
                 active_gid = _gid_for_para(para_index)
-                continue
+                if not tables:
+                    continue
             compact_line = re.sub(r"\s+", "", text)
             if compact_line and (
                 re.fullmatch(r"[가-힣·ㆍ‧･․]{2,12}분야", compact_line)
@@ -657,7 +768,14 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
                                     for w in _tokenize(node)
                                     if not _skip_note_word(w)
                                 )
+            mixed_texts = [
+                str(payload).strip()
+                for kind, payload in (_para_text_table_events(para) if tables else [])
+                if kind == "text"
+            ]
             if ended:
+                for t in mixed_texts:
+                    _absorb_note_text(t, para_index)
                 continue
 
             for shp in shapes:
@@ -671,6 +789,8 @@ def check_conservation_root(root: etree._Element, result: dict[str, Any]) -> dic
                         notes_figure_text.append({"text": w, "para_index": para_index})
 
             if tables:
+                for t in mixed_texts:
+                    _absorb_note_text(t, para_index)
                 continue
             if not text:
                 continue

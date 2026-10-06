@@ -63,6 +63,21 @@ def _fix_pua(s: str) -> str:
     return "".join(out)
 
 
+_SUPER_TRANS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def _eq_text(script: str) -> str:
+    s = script.replace("`", "")
+    s = s.replace("~", " ")
+    s = re.sub(r"(?<![A-Za-z])\s*TIMES\s*(?![A-Za-z])", "×", s)
+    s = re.sub(r"\s*\^\{(\d+)\}", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r"\s*\^(\d+)", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r" {2,}", " ", s).strip()
+    if re.search(r"[{}^_#&]", s) or re.search(r"[A-Za-z]{2,}", s):
+        return re.sub(r" {2,}", " ", script).strip()
+    return s
+
+
 def _validate_half(half: str, src_path: str | Path) -> list[str]:
     if not HALF_FMT_RE.match(half or ""):
         raise ValidationError(f"--half 형식이 올바르지 않습니다(예: 2025H2): {half!r}")
@@ -85,6 +100,10 @@ def _texts_under(el: etree._Element, stop: tuple[str, ...] = _STOP) -> str:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             parts.append(_fix_pua(n.text))
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                parts.append(_eq_text(script))
         for ch in n:
             if ch.tag in stop:
                 continue
@@ -107,6 +126,10 @@ def _cell_text_nodes(cell: etree._Element) -> list[str]:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             out.append(_fix_pua(n.text))
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                out.append(_eq_text(script))
         for ch in n:
             if ch.tag in _STOP:
                 continue
@@ -129,6 +152,53 @@ def _top_controls(para: etree._Element, tag: str) -> list[etree._Element]:
         if not nested:
             out.append(el)
     return out
+
+
+def _nested_in_cell(el: etree._Element, para: etree._Element) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag == "TableCell":
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _inside_tags(el: etree._Element, para: etree._Element, tags: tuple[str, ...]) -> bool:
+    cur = el.getparent()
+    while cur is not None and cur is not para:
+        if cur.tag in tags:
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _para_text_table_events(para: etree._Element) -> list[tuple[str, object]]:
+    """글 조각과 표(글상자 안 표 포함)를 XML 문서 순서로 낸다."""
+    events: list[tuple[str, object]] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            events.append(("text", "".join(buf)))
+            buf.clear()
+
+    for n in para.iter():
+        if n is para:
+            continue
+        if n.tag == "TableControl" and not _nested_in_cell(n, para):
+            flush()
+            events.append(("table", n))
+            continue
+        if _inside_tags(n, para, _STOP):
+            continue
+        if n.tag == "Text" and n.text:
+            buf.append(_fix_pua(n.text))
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                buf.append(_eq_text(script))
+    flush()
+    return events
 
 
 def _table_rows(tbl: etree._Element) -> list[list[dict]]:
@@ -175,7 +245,7 @@ def _parse_price(raw: str) -> tuple[str, int | None, str]:
     digits = compact.replace(",", "")
     if digits.isdigit():
         val = int(digits)
-        return format(val, ","), val, "present"
+        return compact, val, "present"
     return compact, None, "present"
 
 
@@ -439,7 +509,55 @@ def _merge_note_continuations(notes: list[dict]) -> list[dict]:
     return merged
 
 
-def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
+def _record_tagname(rec: object) -> str:
+    if isinstance(rec, dict):
+        return str(rec.get("tagname") or "")
+    return str(getattr(rec, "tagname", "") or "")
+
+
+def _record_payload(rec: object) -> bytes:
+    if isinstance(rec, dict):
+        raw = rec.get("payload")
+    else:
+        raw = getattr(rec, "payload", None)
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    return b""
+
+
+def _eqedit_scripts_from_hwp(hwp: object) -> list[str]:
+    scripts: list[str] = []
+    bodytext = getattr(hwp, "bodytext", None)
+    if bodytext is None:
+        return scripts
+    for i in bodytext.section_indexes():
+        for rec in bodytext.section(i).records():
+            if "EQEDIT" not in _record_tagname(rec):
+                continue
+            payload = _record_payload(rec)
+            if len(payload) < 6:
+                scripts.append("")
+                continue
+            nchars = int.from_bytes(payload[4:6], "little")
+            raw = payload[6 : 6 + nchars * 2]
+            scripts.append(raw.decode("utf-16le", errors="replace"))
+    return scripts
+
+
+def _attach_eqedit_scripts(hwp: object, root: etree._Element, warnings: list[str] | None) -> None:
+    scripts = _eqedit_scripts_from_hwp(hwp)
+    eqs = list(root.iter("EqEdit"))
+    if len(scripts) != len(eqs):
+        if warnings is not None:
+            warnings.append(
+                f"수식 레코드 수({len(scripts)})와 EqEdit 수({len(eqs)})가 달라 수식을 붙이지 않습니다"
+            )
+        return
+    for el, script in zip(eqs, scripts):
+        el.set("script", script)
+
+
+def _hwp_to_root(hwp_path: str | Path, warnings: list[str] | None = None) -> etree._Element:
     try:
         from hwp5.xmlmodel import Hwp5File
     except ImportError as e:
@@ -449,7 +567,9 @@ def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
         buf = io.BytesIO()
         hwp.xmlevents().dump(buf)
         buf.seek(0)
-        return etree.parse(buf).getroot()
+        root = etree.parse(buf).getroot()
+        _attach_eqedit_scripts(hwp, root, warnings)
+        return root
     finally:
         close = getattr(hwp, "close", None)
         if callable(close):
@@ -738,6 +858,57 @@ def extract_from_root(
         last_sub = current_sub
         last_prev_name = prev_name
 
+    def handle_one_table(tbl: etree._Element, section_id: int, para_index: int) -> None:
+        nonlocal table_index, in_notes, last_major, last_major_name
+        table_index += 1
+        rows = _table_rows(tbl)
+        if not rows:
+            return
+        if _is_record_header(rows[0]):
+            handle_record_table(rows, section_id, para_index, table_index)
+            return
+        banner = _parse_banner(rows[0]) if len(rows) == 1 else None
+        if banner:
+            flush_notes()
+            last_major, last_major_name = banner
+            return
+        if in_notes or (last_group is not None and not _is_diagram_table(rows)):
+            if _is_diagram_table(rows):
+                return
+            flat = _flatten_subtable(rows)
+            if flat:
+                if not in_notes:
+                    in_notes = True
+                note_lines.append(flat)
+        # 그 외(목차·표지 표)는 버린다
+
+    def handle_para_text(text_s: str, section_id: int, para_index: int) -> None:
+        nonlocal in_notes
+        if not text_s:
+            return
+        if _is_figure_caption(text_s):
+            add_figure(text_s)
+            return
+        if text_s.startswith("■"):
+            new_group(text_s, section_id, para_index)
+            return
+        if _is_danga_label(text_s):
+            in_notes = True
+            table_seq.note_seen(last_group["group_id"] if last_group else None)
+            return
+        if last_group is not None and not in_notes and text_s and (
+            text_s[0] in CIRCLED or text_s.startswith("※")
+        ):
+            in_notes = True
+        if in_notes:
+            note_lines.append(text_s)
+
+    def handle_shapes(shapes: list[etree._Element]) -> None:
+        for shp in shapes:
+            cap = _texts_under(shp, stop=("TableControl",)).strip()
+            if _is_figure_caption(cap):
+                add_figure(cap)
+
     for sec_i, section in enumerate(sections):
         section_id = int(section.get("section-id") or sec_i)
         page_def = section.find("PageDef")
@@ -763,55 +934,16 @@ def extract_from_root(
                     last_major_name = ""
                 last_field = field_hit
 
-            for tbl in tables:
-                table_index += 1
-                rows = _table_rows(tbl)
-                if not rows:
-                    continue
-                if _is_record_header(rows[0]):
-                    handle_record_table(rows, section_id, para_index, table_index)
-                    continue
-                banner = _parse_banner(rows[0]) if len(rows) == 1 else None
-                if banner:
-                    flush_notes()
-                    last_major, last_major_name = banner
-                    continue
-                if in_notes or (last_group is not None and not _is_diagram_table(rows)):
-                    if _is_diagram_table(rows):
-                        continue
-                    flat = _flatten_subtable(rows)
-                    if flat:
-                        if not in_notes:
-                            in_notes = True
-                        note_lines.append(flat)
-                # 그 외(목차·표지 표)는 버린다
-
-            for shp in shapes:
-                cap = _texts_under(shp, stop=("TableControl",)).strip()
-                if _is_figure_caption(cap):
-                    add_figure(cap)
-
             if tables:
-                continue
-
-            if not text_s:
-                continue
-            if _is_figure_caption(text_s):
-                add_figure(text_s)
-                continue
-            if text_s.startswith("■"):
-                new_group(text_s, section_id, para_index)
-                continue
-            if _is_danga_label(text_s):
-                in_notes = True
-                table_seq.note_seen(last_group["group_id"] if last_group else None)
-                continue
-            if last_group is not None and not in_notes and text_s and (
-                text_s[0] in CIRCLED or text_s.startswith("※")
-            ):
-                in_notes = True
-            if in_notes:
-                note_lines.append(text_s)
+                for kind, payload in _para_text_table_events(para):
+                    if kind == "table":
+                        handle_one_table(payload, section_id, para_index)
+                    else:
+                        handle_para_text(str(payload).strip(), section_id, para_index)
+                handle_shapes(shapes)
+            else:
+                handle_shapes(shapes)
+                handle_para_text(text_s, section_id, para_index)
 
         pages_out.append(
             {
@@ -854,7 +986,7 @@ def extract_hwp(hwp_path: str | Path, half: str) -> dict:
     warnings = _validate_half(half, hwp_path)
     sha = _sha256(hwp_path)
     try:
-        root = _hwp_to_root(hwp_path)
+        root = _hwp_to_root(hwp_path, warnings=warnings)
     except ValidationError:
         raise
     except Exception as e:
