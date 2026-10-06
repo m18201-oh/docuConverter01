@@ -780,6 +780,31 @@ def run_all() -> Check:
     ts = TableSeq()
     c.check("T5 record(None)·note_seen(None) 은 None", ts.record(None) is None and ts.note_seen(None) is None)
 
+    from .extract import _parse_price as parse_price_pdf
+    from .extract_hwp import _parse_price as parse_price_hwp
+
+    for name, fn in (("pdf", parse_price_pdf), ("hwp", parse_price_hwp)):
+        c.check(
+            f"P1 {name} _parse_price 1,361263",
+            fn("1,361263") == ("1,361263", 1361263, "present"),
+            str(fn("1,361263")),
+        )
+        c.check(
+            f"P2 {name} _parse_price 앞뒤 공백",
+            fn(" 1,234 ") == ("1,234", 1234, "present"),
+            str(fn(" 1,234 ")),
+        )
+        c.check(
+            f"P2 {name} _parse_price 쉼표 옆 공백",
+            fn("1, 234") == ("1,234", 1234, "present"),
+            str(fn("1, 234")),
+        )
+        c.check(
+            f"P3 {name} _parse_price 폐지",
+            fn("폐지") == ("폐지", None, "abolished"),
+            str(fn("폐지")),
+        )
+
     return c
 
 

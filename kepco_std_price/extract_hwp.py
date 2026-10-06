@@ -245,7 +245,7 @@ def _parse_price(raw: str) -> tuple[str, int | None, str]:
     digits = compact.replace(",", "")
     if digits.isdigit():
         val = int(digits)
-        return format(val, ","), val, "present"
+        return compact, val, "present"
     return compact, None, "present"
 
 
