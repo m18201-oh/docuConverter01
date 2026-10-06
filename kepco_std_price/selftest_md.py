@@ -805,6 +805,13 @@ def run_all() -> Check:
             str(fn("폐지")),
         )
 
+    from .extract import _norm_unit
+
+    for raw in ("t", "Ton", "톤", "ton"):
+        c.check(f"U1 _norm_unit({raw!r}) → ton", _norm_unit(raw) == "ton", _norm_unit(raw))
+    c.check("U2 _norm_unit ㎡ → m2", _norm_unit("㎡") == "m2", _norm_unit("㎡"))
+    c.check("U2 _norm_unit m → m", _norm_unit("m") == "m", _norm_unit("m"))
+
     return c
 
 
