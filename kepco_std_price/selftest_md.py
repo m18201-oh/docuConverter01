@@ -843,6 +843,21 @@ def run_all() -> Check:
     _reassign_empty_page_fields(f3, {1})
     c.check("F3 뒤에 내용 있는 쪽이 없으면 그대로", [p["field"] for p in f3] == ["토목", "토목"])
 
+    from .extract import _join_note_lines
+
+    j1 = _join_note_lines(["① 재료비는 제외되", "어 있다."], [False, None])
+    c.check("J1 한글-한글 공백 없음은 붙여 잇는다", j1 == "① 재료비는 제외되어 있다.", j1)
+    j2 = _join_note_lines(["① 재료비 및", "운반비를 포함한다."], [True, None])
+    c.check("J2 줄 끝 공백 있으면 공백으로 잇는다", j2 == "① 재료비 및 운반비를 포함한다.", j2)
+    j3 = _join_note_lines(["① 설치철거,", "잭설치철거를 포함한다."], [False, None])
+    c.check("J3 쉼표 뒤는 공백", j3 == "① 설치철거, 잭설치철거를 포함한다.", j3)
+    j4 = _join_note_lines(["① 규격은 D", "25 이상이다."], [False, None])
+    c.check("J4 한글-한글이 아니면 공백", j4 == "① 규격은 D 25 이상이다.", j4)
+    j5 = _join_note_lines(["① 인", "건비를 포", "함한다."], [False, False, None])
+    c.check("J5 세 줄 붙여 잇는다", j5 == "① 인건비를 포함한다.", j5)
+    j6 = _join_note_lines(["① 재료비는 제외되", "어 있다."], [None, None])
+    c.check("J6 모르면 공백으로 잇는다", j6 == "① 재료비는 제외되 어 있다.", j6)
+
     return c
 
 

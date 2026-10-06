@@ -346,6 +346,54 @@ def _cluster_lines_y(spans: list[Span], gap: float = 4.0) -> list[tuple[float, s
     return [(sum(x.yc for x in ln) / len(ln), _join_line(ln)) for ln in lines]
 
 
+def _eol_spaces_for_lines(
+    chars: list[Span],
+    line_ycs: list[float],
+    x0: float,
+    x1: float,
+) -> list[bool | None]:
+    """줄마다 글자층 가장 오른쪽 글자가 공백인지. 모르면 None."""
+    if not line_ycs:
+        return []
+    buckets: list[list[Span]] = [[] for _ in line_ycs]
+    for c in chars:
+        if not (x0 <= c.xc < x1):
+            continue
+        best_i = min(range(len(line_ycs)), key=lambda i: abs(c.yc - line_ycs[i]))
+        if abs(c.yc - line_ycs[best_i]) > 8.0:
+            continue
+        buckets[best_i].append(c)
+    out: list[bool | None] = []
+    for row in buckets:
+        if not row:
+            out.append(None)
+            continue
+        right = max(row, key=lambda s: s.x1)
+        ch = right.text[-1] if right.text else ""
+        out.append(ch.isspace() if ch else None)
+    return out
+
+
+def _join_note_lines(lines: list[str], eol_space: list[bool | None] | None) -> str:
+    """주석 줄을 한 줄로 잇는다. eol_space 가 None 이면 전부 공백으로 잇는다."""
+    if not lines:
+        return ""
+    if eol_space is None:
+        return " ".join(lines)
+    out = lines[0]
+    for i in range(len(lines) - 1):
+        flag = eol_space[i] if i < len(eol_space) else None
+        a = lines[i]
+        b = lines[i + 1]
+        a_last = a[-1] if a else ""
+        b_first = b[0] if b else ""
+        if flag is False and "가" <= a_last <= "힣" and "가" <= b_first <= "힣":
+            out += b
+        else:
+            out += " " + b
+    return out
+
+
 def _cluster_lines(spans: list[Span], gap: float = 4.0) -> list[str]:
     if not spans:
         return []
@@ -1092,7 +1140,11 @@ def _header_row_trim(
     return best
 
 
-def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
+def _note_items(
+    lines: list[str],
+    pdf_page: int,
+    eol_space: list[bool | None] | None = None,
+) -> list[dict]:
     """주석 줄 목록 -> 항목 목록.
 
     N1: 줄바꿈으로 갈린 항목의 마지막 조각(예 "…포함" 뒤 "한다.")이 짧다는
@@ -1105,17 +1157,33 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
     """
     items: list[dict] = []
     parts: list[str] = []
+    parts_eol: list[bool | None] = []
+
+    def _eol_at(i: int) -> bool | None:
+        if eol_space is None or i >= len(eol_space):
+            return None
+        return eol_space[i]
 
     def flush() -> None:
         if not parts:
             return
-        item = _trim_note(" ".join(parts))
+        joined_space = _trim_note(" ".join(parts))
         item_raw = _trim_note("\n".join(parts))
-        if item and not _is_note_junk(item):
-            items.append({"item": item, "item_raw": item_raw, "pdf_page": pdf_page})
+        if joined_space and not _is_note_junk(joined_space):
+            item = _trim_note(_join_note_lines(parts, parts_eol))
+            items.append(
+                {
+                    "item": item,
+                    "item_raw": item_raw,
+                    "pdf_page": pdf_page,
+                    "_parts": list(parts),
+                    "_eol": list(parts_eol),
+                }
+            )
         parts.clear()
+        parts_eol.clear()
 
-    for line in lines:
+    for i, line in enumerate(lines):
         s = line.strip()
         if not s or s.startswith("【단가정의】") or s.startswith("단가정의"):
             continue
@@ -1126,10 +1194,12 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
             items.append({"item": s, "item_raw": s, "pdf_page": pdf_page, "subtable": True})
             continue
         is_new_item = bool(s) and (s[0] in CIRCLED or s.startswith("※"))
+        e = _eol_at(i)
         if is_new_item:
             flush()
             rest = s[1:].lstrip()
             parts.append(f"{s[0]} {rest}" if rest else s[0])
+            parts_eol.append(e)
             continue
         if parts:
             # 이미 항목이 진행 중: 확실한 구조적 잡음만 걸러내고, 그 외 짧은
@@ -1137,10 +1207,12 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
             if _is_structural_note_junk(s):
                 continue
             parts.append(s)
+            parts_eol.append(e)
         else:
             if _is_note_junk(s):
                 continue
             parts.append(s)
+            parts_eol.append(e)
     flush()
     return items
 
@@ -1183,7 +1255,21 @@ def _merge_note_continuations(notes: list[dict]) -> list[dict]:
                 last_text_idx = len(merged) - 1
             continue
         target = merged[last_text_idx]
-        target["item"] = _trim_note(f"{target['item']} {item}")
+        t_parts = target.get("_parts")
+        n_parts = n.get("_parts")
+        if t_parts and n_parts:
+            t_eol = target.get("_eol")
+            n_eol = n.get("_eol")
+            parts = list(t_parts) + list(n_parts)
+            if t_eol is None or n_eol is None:
+                eol: list[bool | None] | None = None
+            else:
+                eol = list(t_eol) + list(n_eol)
+            target["_parts"] = parts
+            target["_eol"] = eol
+            target["item"] = _trim_note(_join_note_lines(parts, eol))
+        else:
+            target["item"] = _trim_note(f"{target['item']} {item}")
         target["item_raw"] = f"{target.get('item_raw', target['item'])}\n{n.get('item_raw', item)}"
     return merged
 
@@ -1981,9 +2067,12 @@ def extract_pdf(
                         )
                     ]
                 raw_lines_y = _cluster_lines_y(band, gap=6.0)
+                line_eols = _eol_spaces_for_lines(
+                    chars, [yc for yc, _ in raw_lines_y], hx0, hx1
+                )
                 # text lines
-                text_entries: list[tuple[float, str]] = []
-                for ly, ln in raw_lines_y:
+                text_entries: list[tuple[float, str, bool | None]] = []
+                for (ly, ln), eol in zip(raw_lines_y, line_eols):
                     s = ln.strip()
                     if not s:
                         continue
@@ -2017,25 +2106,31 @@ def extract_pdf(
                             continue
                         if re.search(r"매끈한마감|보통마감|거친마감", s):
                             continue
-                    text_entries.append((ly, s))
+                    text_entries.append((ly, s, eol))
                 # N2/N4: 문서상 실제 위치(y) 순서로 표·글줄을 다시 섞는다 — 표를
                 # 항상 앞세우던 예전 방식은 "④…아래와 같다." 뒤에 오는 표가
                 # 엉뚱하게 ③ 앞에 표시되는 순서 뒤바뀜을 냈다.
-                lines_txt = [t for _, t in sorted(table_entries + text_entries, key=lambda e: e[0])]
+                mixed_entries: list[tuple[float, str, bool | None]] = [
+                    (y, t, None) for y, t in table_entries
+                ]
+                mixed_entries.extend(text_entries)
+                mixed_entries.sort(key=lambda e: e[0])
                 word_caps = _figure_captions_from_words(words_all, hx0, hx1, y0, y1)
                 kept_lines: list[str] = []
+                kept_eol: list[bool | None] = []
                 span_caps: list[str] = []
-                for s in lines_txt:
+                for _y, s, eol in mixed_entries:
                     if _is_figure_caption_line(s):
                         span_caps.append(_collapse(s))
                     else:
                         kept_lines.append(s)
+                        kept_eol.append(eol)
                 caps = word_caps or span_caps
                 if caps:
                     grp.setdefault("figures", [])
                     for cap in caps:
                         grp["figures"].append({"caption": cap, "pdf_page": pno})
-                items = _note_items(kept_lines, pno)
+                items = _note_items(kept_lines, pno, kept_eol)
                 if items:
                     current_title = None
                     in_note_zone = True
@@ -2478,12 +2573,23 @@ def extract_pdf(
         for g in groups:
             g["header"] = _restore_spaces(g.get("header") or "", page_chars.get(int(g.get("pdf_page") or 0), []))
             for n in g.get("notes") or []:
-                n["item"] = _restore_spaces(
-                    n.get("item") or "", page_chars.get(int(n.get("pdf_page") or 0), [])
-                )
+                parts = n.get("_parts")
+                if parts:
+                    n["item"] = _restore_spaces(
+                        _trim_note(" ".join(parts)),
+                        page_chars.get(int(n.get("pdf_page") or 0), []),
+                    )
+                else:
+                    n["item"] = _restore_spaces(
+                        n.get("item") or "", page_chars.get(int(n.get("pdf_page") or 0), [])
+                    )
+                n["_eol"] = None
     for g in groups:
         if g.get("notes"):
             g["notes"] = _merge_note_continuations(g["notes"])
+        for n in g.get("notes") or []:
+            n.pop("_parts", None)
+            n.pop("_eol", None)
 
     doc.close()
     return {
