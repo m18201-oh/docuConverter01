@@ -812,6 +812,37 @@ def run_all() -> Check:
     c.check("U2 _norm_unit ㎡ → m2", _norm_unit("㎡") == "m2", _norm_unit("㎡"))
     c.check("U2 _norm_unit m → m", _norm_unit("m") == "m", _norm_unit("m"))
 
+    from .extract import _reassign_empty_page_fields
+
+    f1 = [
+        {"pdf_page": 1, "field": None},
+        {"pdf_page": 2, "field": "토목"},
+        {"pdf_page": 3, "field": "토목"},
+        {"pdf_page": 4, "field": "토목"},
+        {"pdf_page": 5, "field": "건축"},
+    ]
+    _reassign_empty_page_fields(f1, {2, 5})
+    c.check(
+        "F1 빈 쪽 3·4는 건축, 1은 null",
+        f1[0]["field"] is None and f1[2]["field"] == "건축" and f1[3]["field"] == "건축" and f1[1]["field"] == "토목" and f1[4]["field"] == "건축",
+        str([p["field"] for p in f1]),
+    )
+
+    f2 = [
+        {"pdf_page": 1, "field": "토목"},
+        {"pdf_page": 2, "field": "토목"},
+        {"pdf_page": 3, "field": "토목"},
+    ]
+    _reassign_empty_page_fields(f2, {1, 3})
+    c.check("F2 같은 분야 안의 빈 쪽은 그대로", [p["field"] for p in f2] == ["토목", "토목", "토목"])
+
+    f3 = [
+        {"pdf_page": 1, "field": "토목"},
+        {"pdf_page": 2, "field": "토목"},
+    ]
+    _reassign_empty_page_fields(f3, {1})
+    c.check("F3 뒤에 내용 있는 쪽이 없으면 그대로", [p["field"] for p in f3] == ["토목", "토목"])
+
     return c
 
 

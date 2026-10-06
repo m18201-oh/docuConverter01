@@ -1484,6 +1484,35 @@ def _field_at(starts: list[tuple[int, str]], pno: int) -> str | None:
     return name
 
 
+def _reassign_empty_page_fields(pages_out: list[dict], content_pages: set[int]) -> None:
+    """내용 없는 쪽의 field 가 앞 내용 쪽과 같고 뒤 내용 쪽과 다르면 뒤 분야로 고친다."""
+    n = len(pages_out)
+    for i, page in enumerate(pages_out):
+        pno = page.get("pdf_page")
+        if pno in content_pages:
+            continue
+        field = page.get("field")
+        if not field:
+            continue
+        prev_field = None
+        next_field = None
+        for j in range(i - 1, -1, -1):
+            if pages_out[j].get("pdf_page") in content_pages:
+                prev_field = pages_out[j].get("field")
+                break
+        for j in range(i + 1, n):
+            if pages_out[j].get("pdf_page") in content_pages:
+                next_field = pages_out[j].get("field")
+                break
+        if (
+            prev_field is not None
+            and field == prev_field
+            and next_field is not None
+            and next_field != prev_field
+        ):
+            page["field"] = next_field
+
+
 def _row_bands(
     centers: list[float],
     hlines: list[LineSeg],
@@ -2357,6 +2386,21 @@ def extract_pdf(
                 "field": page_field,
             }
         )
+
+    content_pages: set[int] = set()
+    for rec in records:
+        pno = rec.get("pdf_page")
+        if pno is not None:
+            content_pages.add(int(pno))
+    for g in groups:
+        pno = g.get("pdf_page")
+        if pno is not None:
+            content_pages.add(int(pno))
+        for note in g.get("notes") or []:
+            np = note.get("pdf_page")
+            if np is not None:
+                content_pages.add(int(np))
+    _reassign_empty_page_fields(pages_out, content_pages)
 
     # G02i2 F1: 쪽·단 경계에서 잘려 항목 기호 없이 남은 이어짐 항목을, 그룹의
     # notes 가 문서 전체에 걸쳐 다 모인 뒤 한 번에 합친다(그룹별로 페이지 진행
