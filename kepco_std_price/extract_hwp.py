@@ -63,6 +63,21 @@ def _fix_pua(s: str) -> str:
     return "".join(out)
 
 
+_SUPER_TRANS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def _eq_text(script: str) -> str:
+    s = script.replace("`", "")
+    s = s.replace("~", " ")
+    s = re.sub(r"(?<![A-Za-z])\s*TIMES\s*(?![A-Za-z])", "×", s)
+    s = re.sub(r"\s*\^\{(\d+)\}", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r"\s*\^(\d+)", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r" {2,}", " ", s).strip()
+    if re.search(r"[{}^_#&]", s) or re.search(r"[A-Za-z]{2,}", s):
+        return re.sub(r" {2,}", " ", script).strip()
+    return s
+
+
 def _validate_half(half: str, src_path: str | Path) -> list[str]:
     if not HALF_FMT_RE.match(half or ""):
         raise ValidationError(f"--half 형식이 올바르지 않습니다(예: 2025H2): {half!r}")
@@ -85,6 +100,10 @@ def _texts_under(el: etree._Element, stop: tuple[str, ...] = _STOP) -> str:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             parts.append(_fix_pua(n.text))
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                parts.append(_eq_text(script))
         for ch in n:
             if ch.tag in stop:
                 continue
@@ -107,6 +126,10 @@ def _cell_text_nodes(cell: etree._Element) -> list[str]:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             out.append(_fix_pua(n.text))
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                out.append(_eq_text(script))
         for ch in n:
             if ch.tag in _STOP:
                 continue
@@ -170,6 +193,10 @@ def _para_text_table_events(para: etree._Element) -> list[tuple[str, object]]:
             continue
         if n.tag == "Text" and n.text:
             buf.append(_fix_pua(n.text))
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                buf.append(_eq_text(script))
     flush()
     return events
 
@@ -482,7 +509,55 @@ def _merge_note_continuations(notes: list[dict]) -> list[dict]:
     return merged
 
 
-def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
+def _record_tagname(rec: object) -> str:
+    if isinstance(rec, dict):
+        return str(rec.get("tagname") or "")
+    return str(getattr(rec, "tagname", "") or "")
+
+
+def _record_payload(rec: object) -> bytes:
+    if isinstance(rec, dict):
+        raw = rec.get("payload")
+    else:
+        raw = getattr(rec, "payload", None)
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    return b""
+
+
+def _eqedit_scripts_from_hwp(hwp: object) -> list[str]:
+    scripts: list[str] = []
+    bodytext = getattr(hwp, "bodytext", None)
+    if bodytext is None:
+        return scripts
+    for i in bodytext.section_indexes():
+        for rec in bodytext.section(i).records():
+            if "EQEDIT" not in _record_tagname(rec):
+                continue
+            payload = _record_payload(rec)
+            if len(payload) < 6:
+                scripts.append("")
+                continue
+            nchars = int.from_bytes(payload[4:6], "little")
+            raw = payload[6 : 6 + nchars * 2]
+            scripts.append(raw.decode("utf-16le", errors="replace"))
+    return scripts
+
+
+def _attach_eqedit_scripts(hwp: object, root: etree._Element, warnings: list[str] | None) -> None:
+    scripts = _eqedit_scripts_from_hwp(hwp)
+    eqs = list(root.iter("EqEdit"))
+    if len(scripts) != len(eqs):
+        if warnings is not None:
+            warnings.append(
+                f"수식 레코드 수({len(scripts)})와 EqEdit 수({len(eqs)})가 달라 수식을 붙이지 않습니다"
+            )
+        return
+    for el, script in zip(eqs, scripts):
+        el.set("script", script)
+
+
+def _hwp_to_root(hwp_path: str | Path, warnings: list[str] | None = None) -> etree._Element:
     try:
         from hwp5.xmlmodel import Hwp5File
     except ImportError as e:
@@ -492,7 +567,9 @@ def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
         buf = io.BytesIO()
         hwp.xmlevents().dump(buf)
         buf.seek(0)
-        return etree.parse(buf).getroot()
+        root = etree.parse(buf).getroot()
+        _attach_eqedit_scripts(hwp, root, warnings)
+        return root
     finally:
         close = getattr(hwp, "close", None)
         if callable(close):
@@ -909,7 +986,7 @@ def extract_hwp(hwp_path: str | Path, half: str) -> dict:
     warnings = _validate_half(half, hwp_path)
     sha = _sha256(hwp_path)
     try:
-        root = _hwp_to_root(hwp_path)
+        root = _hwp_to_root(hwp_path, warnings=warnings)
     except ValidationError:
         raise
     except Exception as e:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from lxml import etree
 
-from .extract_hwp import extract_from_root
+from .extract_hwp import extract_from_root, _eq_text
 from .conservation_hwp import check_conservation_root
 from .render_md import render_md
 
@@ -586,6 +586,46 @@ def run_all() -> Check:
         "가3 글이 표보다 앞 → 주석 ①, 레코드 table_seq 1",
         rec_ga3 == [1] and note_ga3 == [1] and bool(notes_ga3) and notes_ga3[0].startswith("①"),
         str((rec_ga3, note_ga3, notes_ga3)),
+    )
+
+    body_na1 = (
+        f"{_text_para('■ MA***** 타일공사')}"
+        f"{_table([hdr, _ts_rec(1, 'MA000.10000', '타일')])}"
+        f"{_text_para('【단가정의】')}"
+        "<Paragraph><LineSeg>"
+        '<Text charshape-id="1" lang="ko">① 이 단가는 500V표면저항치 </Text>'
+        '<EqEdit script="2.5` TIMES 10  ^{4`}"/>'
+        '<Text charshape-id="1" lang="ko">∼Ω 에 적용한다.</Text>'
+        "</LineSeg></Paragraph>"
+    )
+    res_na1 = extract_from_root(etree.fromstring(make_xml_table_seq(body_na1)), "2026H1", sha="g08b")
+    notes_na1 = [n.get("item") or "" for n in (res_na1["groups"][0].get("notes") or [])]
+    c.check(
+        "나1 주석 속 수식이 2.5×10⁴ 로 들어간다",
+        bool(notes_na1) and "2.5×10⁴" in notes_na1[0] and "TIMES" not in notes_na1[0],
+        str(notes_na1),
+    )
+
+    c.check("나2 _eq_text 1.0×10⁶", _eq_text("1.0 TIMES 10  ^{6`}") == "1.0×10⁶", _eq_text("1.0 TIMES 10  ^{6`}"))
+    c.check("나2 _eq_text a over b 유지", _eq_text("a over b") == "a over b")
+    c.check("나2 _eq_text x^2", _eq_text("x^2") == "x²")
+
+    body_na3 = (
+        f"{_text_para('■ EQ00* 빈수식')}"
+        f"{_table([hdr, _ts_rec(1, 'EQ000.10000', '빈수식')])}"
+        f"{_text_para('【단가정의】')}"
+        "<Paragraph><LineSeg>"
+        '<Text charshape-id="1" lang="ko">① 이 단가는 </Text>'
+        "<EqEdit/>"
+        '<Text charshape-id="1" lang="ko">빈수식에 적용한다.</Text>'
+        "</LineSeg></Paragraph>"
+    )
+    res_na3 = extract_from_root(etree.fromstring(make_xml_table_seq(body_na3)), "2026H1", sha="g08b")
+    notes_na3 = [n.get("item") or "" for n in (res_na3["groups"][0].get("notes") or [])]
+    c.check(
+        "나3 script 없는 EqEdit 은 끼우지 않는다",
+        bool(notes_na3) and "① 이 단가는 빈수식에 적용한다." in notes_na3[0],
+        str(notes_na3),
     )
 
     return c

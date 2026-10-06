@@ -32,9 +32,22 @@ from .spec import (
 _STOP = ("TableControl", "GShapeObjectControl")
 _PUA_RE = re.compile(r"[\ue000-\uf8ff]")
 FIELD_RE = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야(?:자체표준시장단가)?")
+_SUPER_TRANS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
-def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
+def _eq_text(script: str) -> str:
+    s = script.replace("`", "")
+    s = s.replace("~", " ")
+    s = re.sub(r"(?<![A-Za-z])\s*TIMES\s*(?![A-Za-z])", "×", s)
+    s = re.sub(r"\s*\^\{(\d+)\}", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r"\s*\^(\d+)", lambda m: m.group(1).translate(_SUPER_TRANS), s)
+    s = re.sub(r" {2,}", " ", s).strip()
+    if re.search(r"[{}^_#&]", s) or re.search(r"[A-Za-z]{2,}", s):
+        return re.sub(r" {2,}", " ", script).strip()
+    return s
+
+
+def _hwp_to_root(hwp_path: str | Path, warnings: list[str] | None = None) -> etree._Element:
     try:
         from hwp5.xmlmodel import Hwp5File
     except ImportError as e:
@@ -44,7 +57,30 @@ def _hwp_to_root(hwp_path: str | Path) -> etree._Element:
         buf = io.BytesIO()
         hwp.xmlevents().dump(buf)
         buf.seek(0)
-        return etree.parse(buf).getroot()
+        root = etree.parse(buf).getroot()
+        scripts: list[str] = []
+        for i in hwp.bodytext.section_indexes():
+            for rec in hwp.bodytext.section(i).records():
+                tag = rec.get("tagname") if isinstance(rec, dict) else getattr(rec, "tagname", "")
+                if "EQEDIT" not in str(tag or ""):
+                    continue
+                payload = rec.get("payload") if isinstance(rec, dict) else getattr(rec, "payload", b"")
+                if not isinstance(payload, (bytes, bytearray)) or len(payload) < 6:
+                    scripts.append("")
+                    continue
+                nchars = int.from_bytes(payload[4:6], "little")
+                raw = bytes(payload)[6 : 6 + nchars * 2]
+                scripts.append(raw.decode("utf-16le", errors="replace"))
+        eqs = list(root.iter("EqEdit"))
+        if len(scripts) != len(eqs):
+            if warnings is not None:
+                warnings.append(
+                    f"수식 레코드 수({len(scripts)})와 EqEdit 수({len(eqs)})가 달라 수식을 붙이지 않습니다"
+                )
+        else:
+            for el, script in zip(eqs, scripts):
+                el.set("script", script)
+        return root
     finally:
         close = getattr(hwp, "close", None)
         if callable(close):
@@ -61,6 +97,10 @@ def _texts_under(el: etree._Element, stop: tuple[str, ...] = _STOP) -> str:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             parts.append(n.text)
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                parts.append(_eq_text(script))
         for ch in n:
             if ch.tag in stop:
                 continue
@@ -76,6 +116,10 @@ def _text_nodes(el: etree._Element) -> list[str]:
     def walk(n: etree._Element) -> None:
         if n.tag == "Text" and n.text:
             out.append(n.text)
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                out.append(_eq_text(script))
         for ch in n:
             if ch.tag in _STOP:
                 continue
@@ -146,6 +190,10 @@ def _para_text_table_events(para: etree._Element) -> list[tuple[str, object]]:
             continue
         if n.tag == "Text" and n.text:
             buf.append(n.text)
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                buf.append(_eq_text(script))
     flush()
     return events
 
