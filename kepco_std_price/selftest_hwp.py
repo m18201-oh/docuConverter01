@@ -260,6 +260,23 @@ def make_xml_table_seq(body: str) -> bytes:
     return xml.encode("utf-8")
 
 
+def make_xml_table_title(body: str) -> bytes:
+    xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<HwpDoc version="5.1.1.0">
+  <BodyText>
+    <SectionDef section-id="0">
+      <PageDef width="59528" height="84188" orientation="portrait"/>
+      <ColumnSet>
+        {_text_para("토목분야 자체 표준시장단가")}
+        {body}
+      </ColumnSet>
+    </SectionDef>
+  </BodyText>
+</HwpDoc>
+"""
+    return xml.encode("utf-8")
+
+
 class Check:
     def __init__(self) -> None:
         self.results: list[tuple[str, bool, str]] = []
@@ -627,6 +644,84 @@ def run_all() -> Check:
         bool(notes_na3) and "① 이 단가는 빈수식에 적용한다." in notes_na3[0],
         str(notes_na3),
     )
+
+    hdr = _ts_header()
+    body_tt1 = (
+        f"{_text_para('■ TT01* 제목')}"
+        f"{_text_para('- 가 구간')}"
+        f"{_table([hdr, _ts_rec(1, 'TT010.10000', '가1'), _ts_rec(2, 'TT010.10001', '가2')])}"
+        f"{_text_para('- 나 구간')}"
+        f"{_table([hdr, _ts_rec(1, 'TT010.20000', '나1')])}"
+        f"{_table([hdr, _ts_rec(1, 'TT010.20001', '나2')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 가·나에 적용한다.')}"
+    )
+    res_tt1 = extract_from_root(etree.fromstring(make_xml_table_title(body_tt1)), "2026H1", sha="tt")
+    recs_tt1 = [r for r in res_tt1["records"] if r["group_id"] == res_tt1["groups"][0]["group_id"]]
+    titles_tt1 = [r.get("table_title") for r in recs_tt1]
+    c.check(
+        "제1 첫 표 - 가 구간, 둘째·셋째 표 - 나 구간",
+        titles_tt1 == ["- 가 구간", "- 가 구간", "- 나 구간", "- 나 구간"],
+        str(titles_tt1),
+    )
+
+    body_tt2 = (
+        f"{_text_para('■ TT02* 제목없음')}"
+        f"{_table([hdr, _ts_rec(1, 'TT020.10000', '가')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 가에 적용한다.')}"
+        f"{_table([hdr, _ts_rec(1, 'TT020.20000', '나')])}"
+    )
+    res_tt2 = extract_from_root(etree.fromstring(make_xml_table_title(body_tt2)), "2026H1", sha="tt")
+    titles_tt2 = [r.get("table_title") for r in res_tt2["records"]]
+    c.check("제2 주석 앞뒤 표 전부 null", titles_tt2 == [None, None], str(titles_tt2))
+
+    body_tt3 = (
+        f"{_text_para('■ TT03* 주석뒤')}"
+        f"{_text_para('- 가 구간')}"
+        f"{_table([hdr, _ts_rec(1, 'TT030.10000', '가')])}"
+        f"{_text_para('【단가정의】')}"
+        f"{_text_para('① 이 단가는 가에 적용한다.')}"
+        f"{_table([hdr, _ts_rec(1, 'TT030.20000', '나')])}"
+    )
+    res_tt3 = extract_from_root(etree.fromstring(make_xml_table_title(body_tt3)), "2026H1", sha="tt")
+    titles_tt3 = [r.get("table_title") for r in res_tt3["records"]]
+    c.check(
+        "제3 첫 표 - 가 구간, 둘째 표 null",
+        titles_tt3 == ["- 가 구간", None],
+        str(titles_tt3),
+    )
+
+    body_tt4 = (
+        f"{_text_para('■ TT04* 바로위')}"
+        f"{_text_para('- 가 구간')}"
+        f"{_text_para('- 나 구간')}"
+        f"{_table([hdr, _ts_rec(1, 'TT040.10000', '나')])}"
+    )
+    res_tt4 = extract_from_root(etree.fromstring(make_xml_table_title(body_tt4)), "2026H1", sha="tt")
+    titles_tt4 = [r.get("table_title") for r in res_tt4["records"]]
+    c.check("제4 표 바로 위 한 줄만", titles_tt4 == ["- 나 구간"], str(titles_tt4))
+
+    body_tt5 = (
+        f"{_text_para('■ TT05* 가')}"
+        f"{_text_para('- 가 구간')}"
+        f"{_table([hdr, _ts_rec(1, 'TT050.10000', '가')])}"
+        f"{_text_para('■ TT06* 나')}"
+        f"{_table([hdr, _ts_rec(1, 'TT060.10000', '나')])}"
+    )
+    res_tt5 = extract_from_root(etree.fromstring(make_xml_table_title(body_tt5)), "2026H1", sha="tt")
+    titles_tt5 = [(r["code"], r.get("table_title")) for r in res_tt5["records"]]
+    c.check(
+        "제5 새 그룹의 표는 null",
+        titles_tt5 == [("TT050.10000", "- 가 구간"), ("TT060.10000", None)],
+        str(titles_tt5),
+    )
+
+    keys_tt1 = [list(r.keys()) for r in recs_tt1]
+    key_ok = all(
+        "table_seq" in ks and ks[ks.index("table_seq") + 1] == "table_title" for ks in keys_tt1
+    )
+    c.check("제6 table_title 키가 table_seq 바로 뒤에 있다", key_ok, str(keys_tt1[0] if keys_tt1 else None))
 
     return c
 

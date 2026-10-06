@@ -346,6 +346,54 @@ def _cluster_lines_y(spans: list[Span], gap: float = 4.0) -> list[tuple[float, s
     return [(sum(x.yc for x in ln) / len(ln), _join_line(ln)) for ln in lines]
 
 
+def _eol_spaces_for_lines(
+    chars: list[Span],
+    line_ycs: list[float],
+    x0: float,
+    x1: float,
+) -> list[bool | None]:
+    """줄마다 글자층 가장 오른쪽 글자가 공백인지. 모르면 None."""
+    if not line_ycs:
+        return []
+    buckets: list[list[Span]] = [[] for _ in line_ycs]
+    for c in chars:
+        if not (x0 <= c.xc < x1):
+            continue
+        best_i = min(range(len(line_ycs)), key=lambda i: abs(c.yc - line_ycs[i]))
+        if abs(c.yc - line_ycs[best_i]) > 8.0:
+            continue
+        buckets[best_i].append(c)
+    out: list[bool | None] = []
+    for row in buckets:
+        if not row:
+            out.append(None)
+            continue
+        right = max(row, key=lambda s: s.x1)
+        ch = right.text[-1] if right.text else ""
+        out.append(ch.isspace() if ch else None)
+    return out
+
+
+def _join_note_lines(lines: list[str], eol_space: list[bool | None] | None) -> str:
+    """주석 줄을 한 줄로 잇는다. eol_space 가 None 이면 전부 공백으로 잇는다."""
+    if not lines:
+        return ""
+    if eol_space is None:
+        return " ".join(lines)
+    out = lines[0]
+    for i in range(len(lines) - 1):
+        flag = eol_space[i] if i < len(eol_space) else None
+        a = lines[i]
+        b = lines[i + 1]
+        a_last = a[-1] if a else ""
+        b_first = b[0] if b else ""
+        if flag is False and "가" <= a_last <= "힣" and "가" <= b_first <= "힣":
+            out += b
+        else:
+            out += " " + b
+    return out
+
+
 def _cluster_lines(spans: list[Span], gap: float = 4.0) -> list[str]:
     if not spans:
         return []
@@ -808,6 +856,50 @@ def _is_danga_label(text: str) -> bool:
     return False
 
 
+def _is_excluded_table_title(s: str) -> bool:
+    """표 제목 줄이 아닌 것(2절 A 3번)."""
+    t = (s or "").strip()
+    if not t:
+        return True
+    if t.startswith("■"):
+        return True
+    if _is_danga_label(t):
+        return True
+    if t[0] in CIRCLED or t.startswith("※"):
+        return True
+    compact = t.replace(" ", "")
+    if compact.startswith("대분류"):
+        return True
+    if FIELD_RE.search(compact) or "자체표준시장단가" in compact:
+        return True
+    if re.fullmatch(r"[가-힣·ㆍ‧･․]{2,12}분야", compact):
+        return True
+    if re.fullmatch(r"-\s*\d+\s*-", t) or re.fullmatch(r"-\d+-", compact):
+        return True
+    if t.startswith("[그림") or t.startswith("[표준도]"):
+        return True
+    first = t.split()[0]
+    if CODE_RE.match(first) or STAR_FIND.match(first):
+        return True
+    if CODE_FIND.match(compact) or STAR_FIND.match(compact):
+        return True
+    return False
+
+
+def _title_above_header(spans: list[Span], hy0: float, x0: float, x1: float) -> str | None:
+    """머리글 위 끝 hy0 위쪽 30pt 안에서 가장 가까운 한 줄. 제외 규칙이면 없음."""
+    band = [s for s in spans if x0 <= s.xc < x1 and (hy0 - 30.0) <= s.yc < hy0]
+    lines = _cluster_lines_y(band, gap=6.0)
+    cand = [(yc, txt) for yc, txt in lines if (hy0 - 30.0) <= yc < hy0]
+    if not cand:
+        return None
+    _yc, txt = max(cand, key=lambda x: x[0])
+    t = _collapse(txt)
+    if not t or _is_excluded_table_title(t):
+        return None
+    return t
+
+
 def _near_table_h(
     sp: Span,
     hlines: list[LineSeg],
@@ -1048,7 +1140,11 @@ def _header_row_trim(
     return best
 
 
-def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
+def _note_items(
+    lines: list[str],
+    pdf_page: int,
+    eol_space: list[bool | None] | None = None,
+) -> list[dict]:
     """주석 줄 목록 -> 항목 목록.
 
     N1: 줄바꿈으로 갈린 항목의 마지막 조각(예 "…포함" 뒤 "한다.")이 짧다는
@@ -1061,17 +1157,33 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
     """
     items: list[dict] = []
     parts: list[str] = []
+    parts_eol: list[bool | None] = []
+
+    def _eol_at(i: int) -> bool | None:
+        if eol_space is None or i >= len(eol_space):
+            return None
+        return eol_space[i]
 
     def flush() -> None:
         if not parts:
             return
-        item = _trim_note(" ".join(parts))
+        joined_space = _trim_note(" ".join(parts))
         item_raw = _trim_note("\n".join(parts))
-        if item and not _is_note_junk(item):
-            items.append({"item": item, "item_raw": item_raw, "pdf_page": pdf_page})
+        if joined_space and not _is_note_junk(joined_space):
+            item = _trim_note(_join_note_lines(parts, parts_eol))
+            items.append(
+                {
+                    "item": item,
+                    "item_raw": item_raw,
+                    "pdf_page": pdf_page,
+                    "_parts": list(parts),
+                    "_eol": list(parts_eol),
+                }
+            )
         parts.clear()
+        parts_eol.clear()
 
-    for line in lines:
+    for i, line in enumerate(lines):
         s = line.strip()
         if not s or s.startswith("【단가정의】") or s.startswith("단가정의"):
             continue
@@ -1082,10 +1194,12 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
             items.append({"item": s, "item_raw": s, "pdf_page": pdf_page, "subtable": True})
             continue
         is_new_item = bool(s) and (s[0] in CIRCLED or s.startswith("※"))
+        e = _eol_at(i)
         if is_new_item:
             flush()
             rest = s[1:].lstrip()
             parts.append(f"{s[0]} {rest}" if rest else s[0])
+            parts_eol.append(e)
             continue
         if parts:
             # 이미 항목이 진행 중: 확실한 구조적 잡음만 걸러내고, 그 외 짧은
@@ -1093,10 +1207,12 @@ def _note_items(lines: list[str], pdf_page: int) -> list[dict]:
             if _is_structural_note_junk(s):
                 continue
             parts.append(s)
+            parts_eol.append(e)
         else:
             if _is_note_junk(s):
                 continue
             parts.append(s)
+            parts_eol.append(e)
     flush()
     return items
 
@@ -1139,7 +1255,21 @@ def _merge_note_continuations(notes: list[dict]) -> list[dict]:
                 last_text_idx = len(merged) - 1
             continue
         target = merged[last_text_idx]
-        target["item"] = _trim_note(f"{target['item']} {item}")
+        t_parts = target.get("_parts")
+        n_parts = n.get("_parts")
+        if t_parts and n_parts:
+            t_eol = target.get("_eol")
+            n_eol = n.get("_eol")
+            parts = list(t_parts) + list(n_parts)
+            if t_eol is None or n_eol is None:
+                eol: list[bool | None] | None = None
+            else:
+                eol = list(t_eol) + list(n_eol)
+            target["_parts"] = parts
+            target["_eol"] = eol
+            target["item"] = _trim_note(_join_note_lines(parts, eol))
+        else:
+            target["item"] = _trim_note(f"{target['item']} {item}")
         target["item_raw"] = f"{target.get('item_raw', target['item'])}\n{n.get('item_raw', item)}"
     return merged
 
@@ -1621,6 +1751,8 @@ def extract_pdf(
     hangul_span_texts: list[str] = []
     page_chars: dict[int, list[Span]] = {}
     table_seq = TableSeq()
+    current_title: str | None = None
+    in_note_zone = False
 
     # --pages 중간부터여도 앞쪽 배너를 읽어 대분류를 이어받는다
     if start > 1:
@@ -1645,6 +1777,8 @@ def extract_pdf(
         # 그 사이 글줄을 어느 그룹에도 붙이지 않는다.
         if last_group is not None and last_group.get("field") not in (None, page_field):
             last_group = None
+            current_title = None
+            in_note_zone = False
         spans_all = _page_spans(page)
         chars_all = _page_chars(page)
         page_chars[pno] = chars_all
@@ -1681,10 +1815,14 @@ def extract_pdf(
                     cover_halves.add(ph)
             if not cover_halves:
                 last_group = None
+                current_title = None
+                in_note_zone = False
 
         for ph, hx0, hx1 in halves:
             if ph in cover_halves:
                 last_group = None
+                current_title = None
+                in_note_zone = False
             spans = [s for s in spans_all if _in_half(s, hx0, hx1)]
             chars = [s for s in chars_all if _in_half(s, hx0, hx1)]
             printed = _printed(spans_all, hx0, hx1, page.rect.height)
@@ -1756,11 +1894,13 @@ def extract_pdf(
             half_started = False
 
             def new_group(header_span: Span) -> dict:
-                nonlocal group_seq, last_group, last_major, last_sub, last_prev_name
+                nonlocal group_seq, last_group, last_major, last_sub, last_prev_name, current_title, in_note_zone
                 group_seq += 1
                 # 새 ■ 그룹은 새 주제이므로 직전 그룹의 소제목·명칭 이어받기를 끊는다.
                 last_sub = None
                 last_prev_name = ""
+                current_title = None
+                in_note_zone = False
                 raw = _line_text_at(spans, header_span.yc, hx0, hx1, tol=10)
                 if raw.startswith("■") and len(raw) > 1 and raw[1] != " ":
                     raw = "■ " + raw[1:]
@@ -1790,6 +1930,7 @@ def extract_pdf(
                 return g
 
             def attach_notes_from(y0: float, y1: float, grp: dict | None) -> None:
+                nonlocal current_title, in_note_zone
                 if grp is None:
                     return
                 # lines between y0 and y1, excluding table codes already handled
@@ -1926,9 +2067,12 @@ def extract_pdf(
                         )
                     ]
                 raw_lines_y = _cluster_lines_y(band, gap=6.0)
+                line_eols = _eol_spaces_for_lines(
+                    chars, [yc for yc, _ in raw_lines_y], hx0, hx1
+                )
                 # text lines
-                text_entries: list[tuple[float, str]] = []
-                for ly, ln in raw_lines_y:
+                text_entries: list[tuple[float, str, bool | None]] = []
+                for (ly, ln), eol in zip(raw_lines_y, line_eols):
                     s = ln.strip()
                     if not s:
                         continue
@@ -1962,26 +2106,34 @@ def extract_pdf(
                             continue
                         if re.search(r"매끈한마감|보통마감|거친마감", s):
                             continue
-                    text_entries.append((ly, s))
+                    text_entries.append((ly, s, eol))
                 # N2/N4: 문서상 실제 위치(y) 순서로 표·글줄을 다시 섞는다 — 표를
                 # 항상 앞세우던 예전 방식은 "④…아래와 같다." 뒤에 오는 표가
                 # 엉뚱하게 ③ 앞에 표시되는 순서 뒤바뀜을 냈다.
-                lines_txt = [t for _, t in sorted(table_entries + text_entries, key=lambda e: e[0])]
+                mixed_entries: list[tuple[float, str, bool | None]] = [
+                    (y, t, None) for y, t in table_entries
+                ]
+                mixed_entries.extend(text_entries)
+                mixed_entries.sort(key=lambda e: e[0])
                 word_caps = _figure_captions_from_words(words_all, hx0, hx1, y0, y1)
                 kept_lines: list[str] = []
+                kept_eol: list[bool | None] = []
                 span_caps: list[str] = []
-                for s in lines_txt:
+                for _y, s, eol in mixed_entries:
                     if _is_figure_caption_line(s):
                         span_caps.append(_collapse(s))
                     else:
                         kept_lines.append(s)
+                        kept_eol.append(eol)
                 caps = word_caps or span_caps
                 if caps:
                     grp.setdefault("figures", [])
                     for cap in caps:
                         grp["figures"].append({"caption": cap, "pdf_page": pno})
-                items = _note_items(kept_lines, pno)
+                items = _note_items(kept_lines, pno, kept_eol)
                 if items:
+                    current_title = None
+                    in_note_zone = True
                     gid = grp.get("group_id")
                     for it in items:
                         it["table_seq"] = table_seq.note_seen(gid)
@@ -2067,11 +2219,13 @@ def extract_pdf(
                     lab = None
                     header_yc = None
                     header_y1 = None
+                    header_hy0 = None
                     for hyc, labels, hy1, hy0 in headers:
                         if hyc < y_min - 2 and y_min - hyc < 90:
                             lab = labels
                             header_yc = hyc
                             header_y1 = hy1
+                            header_hy0 = hy0
                     # table x from wide H lines
                     y_top_search = (header_yc - 25) if header_yc else (y_min - 40)
                     wide = _wide_h(hlines, y_top_search, y_max + 40, min_w * 0.8)
@@ -2088,6 +2242,11 @@ def extract_pdf(
                     # 헤더에 단가가 없고 격자 가로선도 없으면 목록/색인
                     if (lab is None or "price" not in lab) and not wide:
                         continue
+
+                    if header_hy0 is not None and not in_note_zone:
+                        found = _title_above_header(spans, header_hy0, hx0, hx1)
+                        if found is not None:
+                            current_title = found
 
                     vxs = _vxs_near(vlines, y_min - 50, y_max + 20, table_x0, table_x1)
                     real_vxs = list(vxs)
@@ -2294,6 +2453,7 @@ def extract_pdf(
                             "printed_page": printed,
                             "group_id": gid,
                             "table_seq": seq,
+                            "table_title": current_title if gid else None,
                             "name_group": name_group if inherited or name_group else None,
                             "bbox": [
                                 round(table_x0, 1),
@@ -2330,6 +2490,7 @@ def extract_pdf(
                                 grp["major"] = code[0]
                             grp["record_count"] = grp.get("record_count", 0) + 1
                         records.append(rec)
+                        in_note_zone = False
 
                     # H1: 이 표 뭉치가 끝나며 도달한 소제목·명칭 상태를 다음 뭉치(쪽·단이
                     # 바뀌어도)로 넘긴다. 그룹이 바뀌면 new_group() 이 다시 끊는다.
@@ -2367,6 +2528,8 @@ def extract_pdf(
                             )
 
                 elif etype == "notes":
+                    current_title = None
+                    in_note_zone = True
                     grp = current_group or last_group
                     table_seq.note_seen(grp["group_id"] if grp else None)
                     attach_notes_from(ey - 2, _header_row_trim(ey, next_y, headers), grp)
@@ -2410,12 +2573,23 @@ def extract_pdf(
         for g in groups:
             g["header"] = _restore_spaces(g.get("header") or "", page_chars.get(int(g.get("pdf_page") or 0), []))
             for n in g.get("notes") or []:
-                n["item"] = _restore_spaces(
-                    n.get("item") or "", page_chars.get(int(n.get("pdf_page") or 0), [])
-                )
+                parts = n.get("_parts")
+                if parts:
+                    n["item"] = _restore_spaces(
+                        _trim_note(" ".join(parts)),
+                        page_chars.get(int(n.get("pdf_page") or 0), []),
+                    )
+                else:
+                    n["item"] = _restore_spaces(
+                        n.get("item") or "", page_chars.get(int(n.get("pdf_page") or 0), [])
+                    )
+                n["_eol"] = None
     for g in groups:
         if g.get("notes"):
             g["notes"] = _merge_note_continuations(g["notes"])
+        for n in g.get("notes") or []:
+            n.pop("_parts", None)
+            n.pop("_eol", None)
 
     doc.close()
     return {

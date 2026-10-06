@@ -334,6 +334,36 @@ def _is_danga_label(text: str) -> bool:
     return "【단가정의】" in t or t == "단가정의"
 
 
+def _is_excluded_table_title(s: str) -> bool:
+    """표 제목 줄이 아닌 것(2절 A 3번)."""
+    t = (s or "").strip()
+    if not t:
+        return True
+    if t.startswith("■"):
+        return True
+    if _is_danga_label(t):
+        return True
+    if t[0] in CIRCLED or t.startswith("※"):
+        return True
+    compact = t.replace(" ", "")
+    if compact.startswith("대분류"):
+        return True
+    if FIELD_RE.search(compact) or "자체표준시장단가" in compact:
+        return True
+    if re.fullmatch(r"[가-힣·ㆍ‧･․]{2,12}분야", compact):
+        return True
+    if re.fullmatch(r"-\s*\d+\s*-", t) or re.fullmatch(r"-\d+-", compact):
+        return True
+    if t.startswith("[그림") or t.startswith("[표준도]"):
+        return True
+    first = t.split()[0]
+    if CODE_FIND.match(first) or STAR_FIND.match(first):
+        return True
+    if CODE_FIND.match(compact) or STAR_FIND.match(compact):
+        return True
+    return False
+
+
 def _parse_field_line(text: str) -> str | None:
     compact = re.sub(r"\s+", "", text)
     m = FIELD_RE.search(compact)
@@ -620,6 +650,8 @@ def extract_from_root(
     group_seq = 0
     table_index = 0
     table_seq = TableSeq()
+    pending_title: str | None = None
+    current_title: str | None = None
 
     def flush_notes() -> None:
         nonlocal in_notes, note_lines
@@ -634,11 +666,13 @@ def extract_from_root(
         in_notes = False
 
     def new_group(header_raw: str, section_id: int, para_index: int) -> dict:
-        nonlocal group_seq, last_group, last_sub, last_prev_name
+        nonlocal group_seq, last_group, last_sub, last_prev_name, pending_title, current_title
         flush_notes()
         group_seq += 1
         last_sub = None
         last_prev_name = ""
+        pending_title = None
+        current_title = None
         raw = header_raw.strip()
         if raw.startswith("■") and len(raw) > 1 and raw[1] != " ":
             raw = "■ " + raw[1:]
@@ -679,8 +713,11 @@ def extract_from_root(
         para_index: int,
         t_index: int,
     ) -> None:
-        nonlocal last_sub, last_prev_name, last_group
+        nonlocal last_sub, last_prev_name, last_group, pending_title, current_title
         flush_notes()
+        if pending_title:
+            current_title = pending_title
+            pending_title = None
         header = rows[0]
         colmap = _header_fields(header)
         ncols = max((c["col"] + c["colspan"] for r in rows for c in r), default=0)
@@ -822,6 +859,7 @@ def extract_from_root(
                 "printed_page": None,
                 "group_id": gid,
                 "table_seq": seq,
+                "table_title": current_title if gid else None,
                 "name_group": name_group if inherited or name_group else None,
                 "bbox": None,
                 "name_raw": name_raw,
@@ -859,7 +897,7 @@ def extract_from_root(
         last_prev_name = prev_name
 
     def handle_one_table(tbl: etree._Element, section_id: int, para_index: int) -> None:
-        nonlocal table_index, in_notes, last_major, last_major_name
+        nonlocal table_index, in_notes, last_major, last_major_name, pending_title, current_title
         table_index += 1
         rows = _table_rows(tbl)
         if not rows:
@@ -867,6 +905,7 @@ def extract_from_root(
         if _is_record_header(rows[0]):
             handle_record_table(rows, section_id, para_index, table_index)
             return
+        pending_title = None
         banner = _parse_banner(rows[0]) if len(rows) == 1 else None
         if banner:
             flush_notes()
@@ -879,14 +918,16 @@ def extract_from_root(
             if flat:
                 if not in_notes:
                     in_notes = True
+                    current_title = None
                 note_lines.append(flat)
         # 그 외(목차·표지 표)는 버린다
 
     def handle_para_text(text_s: str, section_id: int, para_index: int) -> None:
-        nonlocal in_notes
+        nonlocal in_notes, pending_title, current_title
         if not text_s:
             return
         if _is_figure_caption(text_s):
+            pending_title = None
             add_figure(text_s)
             return
         if text_s.startswith("■"):
@@ -894,14 +935,24 @@ def extract_from_root(
             return
         if _is_danga_label(text_s):
             in_notes = True
+            pending_title = None
+            current_title = None
             table_seq.note_seen(last_group["group_id"] if last_group else None)
             return
         if last_group is not None and not in_notes and text_s and (
             text_s[0] in CIRCLED or text_s.startswith("※")
         ):
             in_notes = True
+            pending_title = None
+            current_title = None
         if in_notes:
             note_lines.append(text_s)
+            return
+        collapsed = _collapse(text_s)
+        if collapsed and not _is_excluded_table_title(collapsed):
+            pending_title = collapsed
+        else:
+            pending_title = None
 
     def handle_shapes(shapes: list[etree._Element]) -> None:
         for shp in shapes:
@@ -932,6 +983,8 @@ def extract_from_root(
                     last_group = None
                     last_major = ""
                     last_major_name = ""
+                    pending_title = None
+                    current_title = None
                 last_field = field_hit
 
             if tables:
