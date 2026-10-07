@@ -611,6 +611,14 @@ def _collapse(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _join_cell_lines(raw: str) -> str:
+    lines = raw.split("\n")
+    out = lines[0] if lines else ""
+    for ln in lines[1:]:
+        out += ("" if out.endswith("/") else " ") + ln
+    return re.sub(r"\s+", " ", out).strip()
+
+
 def _is_inherit(s: str) -> bool:
     t = re.sub(r"\s+", "", s)
     return bool(t) and all(c in INHERIT_CHARS for c in t)
@@ -2424,10 +2432,10 @@ def extract_pdf(
                                     f"half={half} pdf_page={pno} name_raw={name_raw!r}"
                                 )
                         else:
-                            name = _collapse(name_raw)
+                            name = _join_cell_lines(name_raw)
                             prev_name = name
 
-                        spec = _collapse(spec_raw) if spec_raw.strip() else spec_raw.strip()
+                        spec = _join_cell_lines(spec_raw) if spec_raw.strip() else spec_raw.strip()
 
                         # L2: 소수·범위·단위가 붙은 단가는 드롭하지 않고 price=null 로 남긴다.
                         # 단가 칸이 아예 비어 있는 가짜 행은 기존처럼 본문이 아니다.

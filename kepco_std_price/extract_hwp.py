@@ -1,12 +1,11 @@
 """HWP 5 바이너리 → 한전 표준시장단가 레코드/그룹/소제목/쪽.
 
-표는 pyhwp XML(`hwp5.xmlmodel`) 경로만 쓴다. 한컴 COM 은 쓰지 않는다.
-PDF 경로(`extract.py`)의 추출 함수를 부르지 않는다.
+표·문단·수식 원문 모두 olefile 로 한글 원본의 레코드를 직접 읽어(`hwp_records`) 나무를 만든다.
+한컴 COM 은 쓰지 않는다. PDF 경로(`extract.py`)의 추출 함수를 부르지 않는다.
 """
 from __future__ import annotations
 
 import hashlib
-import io
 import re
 from pathlib import Path
 
@@ -226,6 +225,14 @@ def _table_rows(tbl: etree._Element) -> list[list[dict]]:
 
 def _collapse(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _join_cell_lines(raw: str) -> str:
+    lines = raw.split("\n")
+    out = lines[0] if lines else ""
+    for ln in lines[1:]:
+        out += ("" if out.endswith("/") else " ") + ln
+    return re.sub(r"\s+", " ", out).strip()
 
 
 def _is_inherit(s: str) -> bool:
@@ -539,71 +546,10 @@ def _merge_note_continuations(notes: list[dict]) -> list[dict]:
     return merged
 
 
-def _record_tagname(rec: object) -> str:
-    if isinstance(rec, dict):
-        return str(rec.get("tagname") or "")
-    return str(getattr(rec, "tagname", "") or "")
-
-
-def _record_payload(rec: object) -> bytes:
-    if isinstance(rec, dict):
-        raw = rec.get("payload")
-    else:
-        raw = getattr(rec, "payload", None)
-    if isinstance(raw, (bytes, bytearray)):
-        return bytes(raw)
-    return b""
-
-
-def _eqedit_scripts_from_hwp(hwp: object) -> list[str]:
-    scripts: list[str] = []
-    bodytext = getattr(hwp, "bodytext", None)
-    if bodytext is None:
-        return scripts
-    for i in bodytext.section_indexes():
-        for rec in bodytext.section(i).records():
-            if "EQEDIT" not in _record_tagname(rec):
-                continue
-            payload = _record_payload(rec)
-            if len(payload) < 6:
-                scripts.append("")
-                continue
-            nchars = int.from_bytes(payload[4:6], "little")
-            raw = payload[6 : 6 + nchars * 2]
-            scripts.append(raw.decode("utf-16le", errors="replace"))
-    return scripts
-
-
-def _attach_eqedit_scripts(hwp: object, root: etree._Element, warnings: list[str] | None) -> None:
-    scripts = _eqedit_scripts_from_hwp(hwp)
-    eqs = list(root.iter("EqEdit"))
-    if len(scripts) != len(eqs):
-        if warnings is not None:
-            warnings.append(
-                f"수식 레코드 수({len(scripts)})와 EqEdit 수({len(eqs)})가 달라 수식을 붙이지 않습니다"
-            )
-        return
-    for el, script in zip(eqs, scripts):
-        el.set("script", script)
-
-
 def _hwp_to_root(hwp_path: str | Path, warnings: list[str] | None = None) -> etree._Element:
-    try:
-        from hwp5.xmlmodel import Hwp5File
-    except ImportError as e:
-        raise ImportError("uv sync --extra hwp 필요") from e
-    hwp = Hwp5File(str(hwp_path))
-    try:
-        buf = io.BytesIO()
-        hwp.xmlevents().dump(buf)
-        buf.seek(0)
-        root = etree.parse(buf).getroot()
-        _attach_eqedit_scripts(hwp, root, warnings)
-        return root
-    finally:
-        close = getattr(hwp, "close", None)
-        if callable(close):
-            close()
+    from .hwp_records import hwp_to_root
+
+    return hwp_to_root(hwp_path)
 
 
 def _anchor(section: int, para_index: int, table_index: int | None, row: int | None) -> dict:
@@ -836,10 +782,10 @@ def extract_from_root(
                         f"명칭 상속 실패(이어받을 명칭 없음): code={code} half={half} name_raw={name_raw!r}"
                     )
             else:
-                name = _collapse(name_raw)
+                name = _join_cell_lines(name_raw)
                 prev_name = name
 
-            spec = _collapse(spec_raw) if spec_raw.strip() else spec_raw.strip()
+            spec = _join_cell_lines(spec_raw) if spec_raw.strip() else spec_raw.strip()
 
             if status == "present" and price is None and "폐지" not in (price_tok or ""):
                 raw_keep = (price_tok or price_raw or "").strip()
@@ -1043,6 +989,10 @@ def extract_hwp(hwp_path: str | Path, half: str) -> dict:
     except ValidationError:
         raise
     except Exception as e:
+        from .hwp_records import HwpReadError
+
+        if isinstance(e, HwpReadError):
+            raise ValidationError(str(e)) from e
         raise ValidationError(f"손상된 HWP 이거나 열 수 없습니다: {hwp_path}") from e
     body = root.find("BodyText")
     text_blob = "".join(body.itertext()) if body is not None else ""

@@ -858,6 +858,20 @@ def run_all() -> Check:
     j6 = _join_note_lines(["① 재료비는 제외되", "어 있다."], [None, None])
     c.check("J6 모르면 공백으로 잇는다", j6 == "① 재료비는 제외되 어 있다.", j6)
 
+    from .extract import _join_cell_lines as _pdf_join_cell_lines
+
+    c.check(
+        "S1 / 줄바꿈은 빈칸 없이",
+        _pdf_join_cell_lines("쉬트파일박기/진동식/\n(N≦15)") == "쉬트파일박기/진동식/(N≦15)",
+    )
+    c.check(
+        "S2 / 뒤 빈칸은 유지",
+        _pdf_join_cell_lines("쉬트파일박기/진동식/ \n(N≦15)") == "쉬트파일박기/진동식/ (N≦15)",
+    )
+    c.check("S3 일반 줄바꿈은 빈칸", _pdf_join_cell_lines("콘크리트\n타설") == "콘크리트 타설")
+    c.check("S4 연속 / 줄바꿈", _pdf_join_cell_lines("가/\n나/\n다") == "가/나/다")
+    c.check("S5 혼합", _pdf_join_cell_lines("가/\n나  다\n라") == "가/나 다 라")
+
     return c
 
 
