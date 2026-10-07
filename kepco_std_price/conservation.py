@@ -776,10 +776,15 @@ def _reparse_unit_norm(unit: str | None) -> str | None:
     return UNIT_NORM.get(unit, unit)
 
 
-def _collapse_ws(s: str | None) -> str:
-    """extract.py 의 _collapse() 와 같은 규칙(연속 공백 -> 한 칸, 양끝 자르기)을
-    독립적으로 다시 구현한다(추출 코드의 함수를 그대로 불러 쓰지 않는다)."""
-    return re.sub(r"\s+", " ", (s or "")).strip()
+def _join_cell_lines(s: str | None) -> str:
+    """extract.py 의 _join_cell_lines() 와 같은 규칙을 독립적으로 다시 구현한다(추출 코드의 함수를
+    그대로 불러 쓰지 않는다): 줄 사이를 이을 때 윗줄이 「/」로 끝나면 빈칸 없이, 아니면 빈칸 하나로.
+    연속 공백은 한 칸으로, 앞뒤는 뗀다."""
+    lines = (s or "").split("\n")
+    out = lines[0]
+    for ln in lines[1:]:
+        out += ("" if out.endswith("/") else " ") + ln
+    return re.sub(r"\s+", " ", out).strip()
 
 
 _HALF_RANK = {"L": 0, "C": 0, "R": 1}
@@ -902,13 +907,13 @@ def _field_gates(
         if exp_unit != rec.get("unit_norm"):
             mism["unit_norm"] = {"expected": exp_unit, "actual": rec.get("unit_norm"), "unit": rec.get("unit")}
         if not rec.get("name_inherited"):
-            exp_name = _collapse_ws(rec.get("name_raw"))
+            exp_name = _join_cell_lines(rec.get("name_raw"))
             if exp_name != (rec.get("name") or ""):
                 mism["name"] = {"expected": exp_name, "actual": rec.get("name"), "raw": rec.get("name_raw")}
         spec_raw = rec.get("spec_raw")
         if spec_raw is not None:
             spec_raw_s = str(spec_raw)
-            exp_spec = _collapse_ws(spec_raw_s) if spec_raw_s.strip() else spec_raw_s.strip()
+            exp_spec = _join_cell_lines(spec_raw_s) if spec_raw_s.strip() else spec_raw_s.strip()
             if exp_spec != (rec.get("spec") or ""):
                 mism["spec"] = {"expected": exp_spec, "actual": rec.get("spec"), "raw": rec.get("spec_raw")}
         if mism:

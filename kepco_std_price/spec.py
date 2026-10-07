@@ -42,7 +42,7 @@ HEADER_MAP = {
 }
 HEADER_NORM = {k.replace(" ", ""): v for k, v in HEADER_MAP.items()}
 
-UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "톤": "ton", "t": "ton", "Ton": "ton"}
+UNIT_NORM = {"주": "tree", "㎡": "m2", "㎥": "m3", "m²": "m2", "m³": "m3", "톤": "ton", "t": "ton", "Ton": "ton"}
 
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳ⓛ"
 CIRCLED_CHARS = CIRCLED
