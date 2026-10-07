@@ -433,6 +433,7 @@ dependencies = [
     { name = "html2text" },
     { name = "lxml" },
     { name = "marker-pdf", extra = ["full"] },
+    { name = "olefile" },
     { name = "pillow" },
     { name = "pymupdf" },
     { name = "pypdfium2" },
@@ -442,7 +443,6 @@ dependencies = [
 
 [package.optional-dependencies]
 hwp = [
-    { name = "pyhwp" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
 ]
 
@@ -453,8 +453,8 @@ requires-dist = [
     { name = "html2text", specifier = ">=2024.2" },
     { name = "lxml", specifier = ">=5" },
     { name = "marker-pdf", extras = ["full"], specifier = ">=1.10.1,<1.11" },
+    { name = "olefile", specifier = ">=0.47" },
     { name = "pillow", specifier = ">=10.1,<11" },
-    { name = "pyhwp", marker = "extra == 'hwp'", specifier = ">=0.1b15" },
     { name = "pymupdf", specifier = ">=1.26" },
     { name = "pypdfium2", specifier = ">=4.30" },
     { name = "pywin32", marker = "sys_platform == 'win32' and extra == 'hwp'", specifier = ">=306" },
@@ -1600,17 +1600,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/36/ee/fb410c5c854b6a081
 wheels = [
     { url = "https://files.pythonhosted.org/packages/22/11/47efe2f66ba848a107adfd490b508f5c0cedc82127950553dca44d29e6c4/pydyf-0.12.1-py3-none-any.whl", hash = "sha256:ea25b4e1fe7911195cb57067560daaa266639184e8335365cc3ee5214e7eaadc", size = 8028, upload-time = "2025-12-02T14:52:12.938Z" },
 ]
-
-[[package]]
-name = "pyhwp"
-version = "0.1b15"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cryptography", marker = "platform_python_implementation != 'Jython'" },
-    { name = "lxml", marker = "platform_python_implementation != 'Jython'" },
-    { name = "olefile", marker = "platform_python_implementation != 'Jython'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ec/38/2a95e3772d9168065f3391d62012f6b34e122d8eafd2ebcccf675a3ef23d/pyhwp-0.1b15.tar.gz", hash = "sha256:85146a1d0ef2a4bd356b2f15f78d172fbe85f9f1fc8c2d8d2a9f65ed23113328", size = 218143, upload-time = "2020-05-30T07:19:34.965Z" }
 
 [[package]]
 name = "pymupdf"
