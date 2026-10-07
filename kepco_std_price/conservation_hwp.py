@@ -1,12 +1,14 @@
-"""HWP 원문 XML 과 산출을 대조하는 보존 게이트.
+"""HWP 원문 나무와 산출을 대조하는 보존 게이트.
 
-extract_hwp / extract.py 의 추출 함수를 재사용하지 않는다. XML 을 다시 읽어
-레코드 표 셀 Text·주석 문단 낱말을 독립적으로 센다.
+extract_hwp / extract.py 의 추출 함수를 재사용하지 않는다. 한글 원본을 이 파일 안의
+독자 읽기 코드로 다시 읽어 레코드 표 셀 Text·주석 문단 낱말을 독립적으로 센다.
 """
 from __future__ import annotations
 
 import hashlib
 import re
+import struct
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -47,39 +49,55 @@ def _eq_text(script: str) -> str:
 
 
 
-import json
-import os
-import shutil
-import struct
-import subprocess
-import tempfile
-import zlib
+# ---------------------------------------------------------------------------
+# 한글(HWP 5.0) 원본 읽기 — 검사기 쪽 독자 사본.
+# 추출기(`hwp_records`)와 코드를 나눠 쓰지 않고 같은 방법으로 따로 쓴다.
+# 공개된 HWP 5.0 문서 형식만 보고 쓴 독자 구현이다(레코드·PARA_TEXT·글자 모양·표 레코드).
+# ---------------------------------------------------------------------------
 
-_G_HWPTAG_PARA_HEADER = 66
-_G_HWPTAG_PARA_TEXT = 67
-_G_HWPTAG_CTRL_HEADER = 71
-_G_HWPTAG_PAGE_DEF = 73
-_G_HWPTAG_TABLE = 77
-_G_HWPTAG_EQEDIT = 88
-_G_CTRL_TABLE = b" lbt"
-_G_CTRL_GSO = b" osg"
-_G_CTRL_EQEDIT = b"deqe"
-_EXT_CTRL = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23})
-_PAIRED_EXT = _EXT_CTRL - {9}
-_GATE_NODE_MSG = (
-    "Node.js 20 이상이 필요합니다(https://nodejs.org 의 LTS, "
-    "Windows 는 winget install OpenJS.NodeJS.LTS)"
-)
-_GATE_VENDOR_KORDOC = Path(__file__).resolve().parent / "vendor" / "kordoc" / "kordoc_bundle.mjs"
+_RD_HWPTAG_CHAR_SHAPE = 21
+_RD_HWPTAG_PARA_HEADER = 66
+_RD_HWPTAG_PARA_TEXT = 67
+_RD_HWPTAG_PARA_CHAR_SHAPE = 68
+_RD_HWPTAG_PARA_LINE_SEG = 69
+_RD_HWPTAG_CTRL_HEADER = 71
+_RD_HWPTAG_LIST_HEADER = 72
+_RD_HWPTAG_PAGE_DEF = 73
+_RD_HWPTAG_TABLE = 77
+_RD_HWPTAG_EQEDIT = 88
 
-class _GateHwpError(Exception):
-    """한글 원본·kordoc 읽기에서 멈추는 오류."""
+_RD_CTRL_TABLE = b" lbt"
+_RD_CTRL_GSO = b" osg"
+_RD_CTRL_EQEDIT = b"deqe"
+_RD_CTRL_SECD = b"dces"
+_RD_CTRL_COLD = b"dloc"
+_RD_CTRL_HEADER_ = b"daeh"
+_RD_CTRL_FOOTER = b"toof"
+
+# 글자 모양 속성의 비트: 15 위 첨자, 16 아래 첨자. 속성은 레코드 46바이트째 UINT32.
+_RD_CHAR_SHAPE_PROP_OFFSET = 46
+_RD_SUPERSCRIPT_BIT = 1 << 15
+_RD_SUBSCRIPT_BIT = 1 << 16
+
+# 제어 문자(0~31). 확장 컨트롤은 CTRL_HEADER 와 짝이 되고, 인라인 컨트롤은 짝이 없지만 8글자를 차지한다.
+_RD_EXTENDED_CTRL = frozenset({1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23})
+_RD_INLINE_CTRL = frozenset({4, 5, 6, 7, 8, 9, 19, 20})
+_RD_CTRL_WIDTH = 8
+
+_RD_SUPERSCRIPT_MAP = {"2": "²", "3": "³"}
 
 
-def _gate_parse_record_header(data: bytes, offset: int = 0) -> tuple[int, int, int, int]:
+class _RdError(Exception):
+    """한글 원본을 읽다가 멈추는 오류."""
+
+
+# ---------------------------------------------------------------- 레코드
+
+
+def _rd_parse_record_header(data: bytes, offset: int = 0) -> tuple[int, int, int, int]:
     """레코드 머리. (tag, level, size, payload_offset). size==0xFFF 이면 다음 4바이트가 크기."""
     if offset + 4 > len(data):
-        raise _GateHwpError("레코드 머리가 잘렸습니다")
+        raise _RdError("레코드 머리가 잘렸습니다")
     h = struct.unpack_from("<I", data, offset)[0]
     payload_off = offset + 4
     tag = h & 0x3FF
@@ -87,173 +105,240 @@ def _gate_parse_record_header(data: bytes, offset: int = 0) -> tuple[int, int, i
     size = h >> 20
     if size == 0xFFF:
         if payload_off + 4 > len(data):
-            raise _GateHwpError("레코드 크기(0xFFF) 다음 4바이트가 없습니다")
+            raise _RdError("레코드 크기(0xFFF) 다음 4바이트가 없습니다")
         size = struct.unpack_from("<I", data, payload_off)[0]
         payload_off += 4
     return tag, level, size, payload_off
 
 
-def _gate_iter_records(data: bytes) -> list[tuple[int, int, bytes]]:
+def _rd_iter_records(data: bytes) -> list[tuple[int, int, bytes]]:
     out: list[tuple[int, int, bytes]] = []
     off = 0
     n = len(data)
-    while off + 4 <= n:
-        tag, level, size, payload_off = _gate_parse_record_header(data, off)
+    while off < n:
+        tag, level, size, payload_off = _rd_parse_record_header(data, off)
         end = payload_off + size
         if end > n:
-            raise _GateHwpError("레코드 본문이 잘렸습니다")
+            raise _RdError("레코드 본문이 잘렸습니다")
         out.append((tag, level, data[payload_off:end]))
         off = end
     return out
 
 
-def _gate_parse_para_text(payload: bytes) -> tuple[str, int]:
-    """PARA_TEXT → (글, 확장·인라인 컨트롤 수). 문단 끝(13)은 글에 넣지 않는다."""
+def _rd_char_shape_props(docinfo_records: list[tuple[int, int, bytes]]) -> list[int]:
+    """DocInfo 의 글자 모양(CHAR_SHAPE) 속성을 id(0부터) 순서로."""
+    props: list[int] = []
+    for tag, _lv, payload in docinfo_records:
+        if tag != _RD_HWPTAG_CHAR_SHAPE:
+            continue
+        if len(payload) < _RD_CHAR_SHAPE_PROP_OFFSET + 4:
+            raise _RdError("글자 모양 레코드가 짧습니다")
+        props.append(struct.unpack_from("<I", payload, _RD_CHAR_SHAPE_PROP_OFFSET)[0])
+    return props
+
+
+# ---------------------------------------------------------------- 문단 글
+
+
+def _rd_units(payload: bytes) -> list[int]:
     if len(payload) % 2:
         payload = payload + b"\x00"
-    u = payload.decode("utf-16le", errors="replace")
-    chars: list[str] = []
-    nctrl = 0
+    return list(struct.unpack("<%dH" % (len(payload) // 2), payload))
+
+
+def _rd_decode(units: list[int]) -> str:
+    return struct.pack("<%dH" % len(units), *units).decode("utf-16le", errors="replace")
+
+
+def _rd_tokens(payload: bytes) -> list[tuple[str, int, int]]:
+    """PARA_TEXT → [(종류, 값, 위치)]. 종류: 'ch' 글자 코드 · 'ext' 확장 컨트롤 · 'inl' 인라인 · 'ctl' 그 밖의 제어 글자.
+
+    위치는 문단 글 안의 UTF-16 글자 위치(컨트롤은 8글자를 차지한다)다.
+    """
+    u = _rd_units(payload)
+    out: list[tuple[str, int, int]] = []
     i = 0
     n = len(u)
     while i < n:
-        o = ord(u[i])
-        if o < 32:
-            if o in _EXT_CTRL:
-                nctrl += 1
-                i += 8
-                continue
+        c = u[i]
+        if c >= 32:
+            out.append(("ch", c, i))
             i += 1
+        elif c in _RD_EXTENDED_CTRL:
+            out.append(("ext", c, i))
+            i += _RD_CTRL_WIDTH
+        elif c in _RD_INLINE_CTRL:
+            out.append(("inl", c, i))
+            i += _RD_CTRL_WIDTH
+        else:
+            out.append(("ctl", c, i))
+            i += 1
+    return out
+
+
+def _rd_parse_para_text(payload: bytes) -> tuple[str, int]:
+    """PARA_TEXT → (글, 확장 컨트롤 수). 인라인 컨트롤(탭 등)·줄바꿈·문단 끝(13)은 글에 넣지 않는다."""
+    toks = _rd_tokens(payload)
+    text = _rd_decode([v for kind, v, _p in toks if kind == "ch"])
+    nctrl = sum(1 for kind, _v, _p in toks if kind == "ext")
+    return text, nctrl
+
+
+# 글자의 언어 갈래. 한글 문서는 글자 갈래가 바뀌는 자리에서 글 조각을 나눈다.
+def _rd_lang(code: int) -> str | None:
+    """강한 글자는 갈래 이름, 앞 글자를 따라가는 글자(숫자·빈칸·구두점)는 None."""
+    if code < 128:
+        ch = chr(code)
+        if ch.isalpha() or ch in "[]~&":
+            return "en"
+        return None
+    if code == 0x3000:
+        return None
+    if 0xA0 <= code <= 0x24F:
+        return "en"
+    if (
+        0x1100 <= code <= 0x11FF
+        or 0x3130 <= code <= 0x318F
+        or 0xA960 <= code <= 0xA97F
+        or 0xAC00 <= code <= 0xD7FF
+        or 0xFFA0 <= code <= 0xFFDC
+    ):
+        return "ko"
+    if 0x3001 <= code <= 0x303F:
+        return "symbol"
+    if 0x3040 <= code <= 0x30FF:
+        return "jp"
+    if 0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:
+        return "cn"
+    if 0xE000 <= code <= 0xF8FF:
+        return "symbol"
+    return "other"
+
+
+def _rd_pairs(payload: bytes | None) -> list[tuple[int, int]]:
+    """PARA_CHAR_SHAPE → [(글자 위치, 글자 모양 id)]."""
+    if not payload:
+        return []
+    n = len(payload) // 8
+    arr = struct.unpack("<%dI" % (n * 2), payload[: n * 8])
+    return [(arr[2 * k], arr[2 * k + 1]) for k in range(n)]
+
+
+def _rd_line_starts(payload: bytes | None) -> list[int]:
+    """PARA_LINE_SEG → 줄이 시작하는 글자 위치(줄마다 36바이트, 첫 UINT32)."""
+    if not payload:
+        return []
+    return [struct.unpack_from("<I", payload, k * 36)[0] for k in range(len(payload) // 36)]
+
+
+def _rd_text_nodes(
+    toks: list[tuple[str, int, int]],
+    shapes: list[tuple[int, int]],
+    line_starts: list[int],
+    props: list[int],
+    in_cell: bool,
+) -> list[str | None]:
+    """글자 토큰 → 순서대로 글 조각(글) 또는 확장 컨트롤 자리(None).
+
+    글 조각은 컨트롤이 나오는 자리·글자 모양이 바뀌는 자리·줄이 시작하는 자리·글자 갈래가 바뀌는 자리에서 끊는다.
+    갈래는 컨트롤·글자 모양·줄로 끊긴 구간마다 정한다: 숫자·빈칸·구두점은 앞의 강한 글자를 따르고,
+    구간 첫머리의 그런 글자는 구간의 첫 강한 글자를 따른다.
+    """
+    shape_at = {pos: sid for pos, sid in shapes}
+    shape_pos = sorted(shape_at)
+    bounds = set(line_starts)
+
+    # 1) 글자마다 글자 모양 id 와 갈래를 정한다.
+    sp = 0
+    cur_shape = 0
+    run: list[tuple[int, int, int]] = []  # (위치, 글자 코드, 글자 모양)
+    lang_of: dict[int, str] = {}
+    prev_lang = "ko"
+
+    def assign() -> None:
+        nonlocal prev_lang, run
+        first = None
+        for _p, c, _s in run:
+            lg = _rd_lang(c)
+            if lg is not None:
+                first = lg
+                break
+        cur = first or prev_lang
+        for p, c, _s in run:
+            lg = _rd_lang(c)
+            if lg is not None:
+                cur = lg
+            lang_of[p] = cur
+        if run:
+            prev_lang = cur
+        run = []
+
+    shape_of: dict[int, int] = {}
+    for kind, v, p in toks:
+        while sp < len(shape_pos) and shape_pos[sp] <= p:
+            cur_shape = shape_at[shape_pos[sp]]
+            sp += 1
+        if kind != "ch":
+            assign()
             continue
-        chars.append(u[i])
-        i += 1
-    return "".join(chars), nctrl
+        if run and (run[-1][2] != cur_shape or p in bounds):
+            assign()
+        run.append((p, v, cur_shape))
+        shape_of[p] = cur_shape
+    assign()
 
-
-def _para_events(payload: bytes) -> list[tuple[str, object]]:
-    """PARA_TEXT 를 글·짝 있는 확장 컨트롤 사건으로 나눈다."""
-    if len(payload) % 2:
-        payload = payload + b"\x00"
-    u = payload.decode("utf-16le", errors="replace")
-    events: list[tuple[str, object]] = []
-    buf: list[str] = []
-    i = 0
-    n = len(u)
+    # 2) 끊어서 글 조각을 만든다.
+    out: list[str | None] = []
+    buf: list[int] = []
+    buf_shape = -1
+    buf_lang = ""
 
     def flush() -> None:
-        if buf:
-            events.append(("text", "".join(buf)))
-            buf.clear()
+        nonlocal buf
+        if not buf:
+            return
+        s = _rd_decode(buf)
+        prop = props[buf_shape] if 0 <= buf_shape < len(props) else 0
+        if in_cell and prop & _RD_SUBSCRIPT_BIT:
+            raise _RdError(f"표 칸에 아래 첨자가 있습니다: {s[:40]!r}")
+        if in_cell and prop & _RD_SUPERSCRIPT_BIT:
+            if any(ch not in _RD_SUPERSCRIPT_MAP for ch in s):
+                raise _RdError(f"표 칸에 2·3 말고 다른 위 첨자가 있습니다: {s[:40]!r}")
+            s = "".join(_RD_SUPERSCRIPT_MAP[ch] for ch in s)
+        out.append(s)
+        buf = []
 
-    while i < n:
-        o = ord(u[i])
-        if o < 32:
-            if o in _EXT_CTRL:
-                if o in _PAIRED_EXT:
-                    flush()
-                    events.append(("ctrl", o))
-                i += 8
-                continue
-            i += 1
+    for kind, v, p in toks:
+        if kind != "ch":
+            flush()
+            if kind == "ext":
+                out.append(None)
             continue
-        buf.append(u[i])
-        i += 1
+        sid = shape_of[p]
+        lg = lang_of[p]
+        if buf and (p in bounds or sid != buf_shape or lg != buf_lang):
+            flush()
+        if not buf:
+            buf_shape = sid
+            buf_lang = lg
+        buf.append(v)
     flush()
-    return events
+    return out
 
 
-def _gate_rewrite_cell_markup(s: str) -> str:
-    """kordoc 칸 글 표기 → 나무에 넣을 글. 허용되지 않는 표기는 오류."""
-    if re.search(r"(?<!\\)\$(?:\\.|[^$\\])+\$", s):
-        raise _GateHwpError(f"표 칸에 수식($…$)이 있습니다: {s[:80]!r}")
-    t = s.replace("\\$", "$").replace("\\<", "<")
-    t = t.replace("<sup>2</sup>", "²").replace("<sup>3</sup>", "³")
-    if re.search(r"<sup>|<sub>|<u>|~~", t):
-        raise _GateHwpError(f"표 칸에 다루지 않는 표기가 있습니다: {s[:80]!r}")
-    return t
+# ---------------------------------------------------------------- 레코드 → 나무
 
 
-def _gate_find_node() -> str | None:
-    env = os.environ.get("KEPCO_NODE")
-    if env is not None and env != "":
-        return env
-    return shutil.which("node")
+def _rd_subtree_end(recs: list[tuple[int, int, bytes]], i: int) -> int:
+    lv = recs[i][1]
+    j = i + 1
+    n = len(recs)
+    while j < n and recs[j][1] > lv:
+        j += 1
+    return j
 
 
-def _gate_node_major(path: str) -> int | None:
-    try:
-        proc = subprocess.run(
-            [path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    raw = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    if raw.startswith("v"):
-        raw = raw[1:]
-    try:
-        return int(raw.split(".")[0])
-    except (ValueError, IndexError):
-        return None
-
-
-def _gate_node_ok() -> bool:
-    path = _gate_find_node()
-    if not path:
-        return False
-    major = _gate_node_major(path)
-    return major is not None and major >= 20
-
-
-def _kordoc_bundle() -> Path:
-    return _GATE_VENDOR_KORDOC
-
-
-def _gate_run_kordoc(hwp_path: str | Path) -> dict:
-    path = _gate_find_node()
-    if not path or not _gate_node_ok():
-        raise _GateHwpError(_GATE_NODE_MSG)
-    bundle = _kordoc_bundle()
-    if not bundle.is_file():
-        raise _GateHwpError(f"동봉 kordoc 이 없습니다: {bundle}")
-    with tempfile.TemporaryDirectory() as td:
-        proc = subprocess.run(
-            [path, str(bundle), str(hwp_path), td],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        chunks = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
-        rec = None
-        if chunks:
-            try:
-                rec = json.loads(chunks[-1])
-            except json.JSONDecodeError:
-                rec = None
-        if proc.returncode != 0 or not isinstance(rec, dict):
-            err = (proc.stderr or proc.stdout or "").strip() or f"exit={proc.returncode}"
-            raise _GateHwpError(f"kordoc 실행에 실패했습니다: {err[:300]}")
-        jp = rec.get("output_json")
-        if not jp:
-            raise _GateHwpError("kordoc 결과에 output_json 이 없습니다")
-        return json.loads(Path(jp).read_text(encoding="utf-8"))
-
-
-def _decompress_stream(data: bytes, compressed: bool) -> bytes:
-    if not compressed:
-        return data
-    return zlib.decompress(data, -15)
-
-
-def _fileheader_compressed(header: bytes) -> bool:
-    if len(header) < 40:
-        return False
-    return bool(struct.unpack_from("<I", header, 36)[0] & 1)
-
-
-def _eqedit_script(payload: bytes) -> str:
+def _rd_eqedit_script(payload: bytes) -> str:
     if len(payload) < 6:
         return ""
     nchars = struct.unpack_from("<H", payload, 4)[0]
@@ -261,307 +346,268 @@ def _eqedit_script(payload: bytes) -> str:
     return raw.decode("utf-16le", errors="replace")
 
 
-def _page_def_size(payload: bytes) -> tuple[int, int]:
+def _rd_page_def_size(payload: bytes) -> tuple[int, int]:
     if len(payload) < 8:
         return 0, 0
     width, height = struct.unpack_from("<II", payload, 0)
     return int(width), int(height)
 
 
-def _table_n_rows(payload: bytes) -> int | None:
-    if len(payload) < 6:
-        return None
-    return int(struct.unpack_from("<H", payload, 4)[0])
+def _rd_table_row_sizes(payload: bytes) -> list[int]:
+    """TABLE 레코드: 속성(4) 행 수(2) 열 수(2) 칸 간격(2) 안 여백(2×4) 다음에 행마다 칸 수."""
+    if len(payload) < 18:
+        raise _RdError("표 레코드가 짧습니다")
+    nrows = struct.unpack_from("<H", payload, 4)[0]
+    if len(payload) < 18 + nrows * 2:
+        raise _RdError("표 레코드의 행 칸 수가 잘렸습니다")
+    return list(struct.unpack_from("<%dH" % nrows, payload, 18))
 
 
-def _nested(recs: list[tuple[int, int, bytes]], start: int, parent_level: int) -> tuple[list[tuple[int, int, bytes]], int]:
-    nested: list[tuple[int, int, bytes]] = []
-    j = start + 1
-    while j < len(recs) and recs[j][1] > parent_level:
-        nested.append(recs[j])
+def _rd_cell_pos(payload: bytes) -> tuple[int, int, int, int]:
+    """칸의 LIST_HEADER: 문단 수(2) 속성(4) 다음 2바이트를 건너뛰고 열·행·열 병합·행 병합(UINT16 ×4)."""
+    if len(payload) < 16:
+        raise _RdError("칸 머리가 짧습니다")
+    col, row, cs, rs = struct.unpack_from("<HHHH", payload, 8)
+    return col, row, cs, rs
+
+
+class _rd_Ctx:
+    def __init__(self, props: list[int]) -> None:
+        self.props = props
+
+
+def _rd_build_paragraph(
+    recs: list[tuple[int, int, bytes]], i: int, ctx: _rd_Ctx, in_cell: bool
+) -> tuple[etree._Element, int]:
+    """recs[i] 가 PARA_HEADER. (Paragraph 요소, 다음 레코드 위치)."""
+    lv = recs[i][1]
+    end = _rd_subtree_end(recs, i)
+    text_pl = None
+    shape_pl = None
+    line_pl = None
+    ctrls: list[tuple[int, int]] = []
+    j = i + 1
+    while j < end:
+        tag, l2, pl = recs[j]
+        if l2 == lv + 1:
+            if tag == _RD_HWPTAG_PARA_TEXT and text_pl is None:
+                text_pl = pl
+            elif tag == _RD_HWPTAG_PARA_CHAR_SHAPE and shape_pl is None:
+                shape_pl = pl
+            elif tag == _RD_HWPTAG_PARA_LINE_SEG and line_pl is None:
+                line_pl = pl
+            elif tag == _RD_HWPTAG_CTRL_HEADER:
+                e = _rd_subtree_end(recs, j)
+                ctrls.append((j, e))
+                j = e
+                continue
         j += 1
-    return nested, j
 
-
-def _gso_text(nested: list[tuple[int, int, bytes]]) -> str:
-    parts: list[str] = []
-    for tag, _lv, payload in nested:
-        if tag == _G_HWPTAG_PARA_TEXT:
-            text, _n = _gate_parse_para_text(payload)
-            if text:
-                parts.append(text)
-    return "".join(parts)
-
-
-def _kordoc_tables(doc: dict) -> list[dict]:
-    tables: list[dict] = []
-    for block in doc.get("blocks") or []:
-        tb = block.get("table") if isinstance(block, dict) else None
-        if tb:
-            tables.append(tb)
-    return tables
-
-
-def _cell_lines(cell: dict) -> list[str]:
-    blocks = cell.get("blocks") if isinstance(cell, dict) else None
-    if blocks:
-        lines: list[str] = []
-        for b in blocks:
-            if not isinstance(b, dict):
-                continue
-            if b.get("type") in (None, "paragraph") or "text" in b:
-                lines.append(_gate_rewrite_cell_markup(str(b.get("text") or "")))
-        return lines or [""]
-    text = _gate_rewrite_cell_markup(str((cell or {}).get("text") or ""))
-    return text.split("\n") if text else [""]
-
-
-def _table_control_from_kordoc(tb: dict) -> etree._Element:
-    grid = tb.get("cells") or []
-    occupied: set[tuple[int, int]] = set()
-    tbl = etree.Element("TableControl")
-    body = etree.SubElement(tbl, "TableBody")
-    for r, row in enumerate(grid):
-        row_el = etree.SubElement(body, "TableRow")
-        if not isinstance(row, list):
+    para = etree.Element("Paragraph")
+    toks = _rd_tokens(text_pl) if text_pl is not None else []
+    nodes = _rd_text_nodes(toks, _rd_pairs(shape_pl), _rd_line_starts(line_pl), ctx.props, in_cell)
+    n_ext = sum(1 for kind, _v, _p in toks if kind == "ext")
+    if n_ext != len(ctrls):
+        raise _RdError(
+            f"문단의 확장 컨트롤 수({n_ext})와 CTRL_HEADER 수({len(ctrls)})가 다릅니다"
+        )
+    ci = 0
+    for item in nodes:
+        if item is not None:
+            t = etree.SubElement(para, "Text")
+            t.text = str(item)
             continue
-        for c, cell in enumerate(row):
-            if (r, c) in occupied:
-                continue
-            if not isinstance(cell, dict):
-                continue
-            cs = int(cell.get("colSpan") or 1)
-            rs = int(cell.get("rowSpan") or 1)
-            for dr in range(rs):
-                for dc in range(cs):
-                    if dr or dc:
-                        occupied.add((r + dr, c + dc))
-            cell_el = etree.SubElement(row_el, "TableCell")
-            cell_el.set("col", str(c))
-            cell_el.set("row", str(r))
-            cell_el.set("colspan", str(cs))
-            cell_el.set("rowspan", str(rs))
-            for line in _cell_lines(cell):
-                para = etree.SubElement(cell_el, "Paragraph")
-                if line:
-                    text_el = etree.SubElement(para, "Text")
-                    text_el.text = line
+        cj, ce = ctrls[ci]
+        ci += 1
+        el = _rd_build_control(recs, cj, ce, ctx, in_cell)
+        if el is not None:
+            para.append(el)
+    return para, end
+
+
+def _rd_paragraphs_in(
+    recs: list[tuple[int, int, bytes]], start: int, end: int, ctx: _rd_Ctx, in_cell: bool, parent: etree._Element
+) -> None:
+    j = start
+    while j < end:
+        if recs[j][0] == _RD_HWPTAG_PARA_HEADER:
+            p, j = _rd_build_paragraph(recs, j, ctx, in_cell)
+            parent.append(p)
+        else:
+            j += 1
+
+
+def _rd_build_control(
+    recs: list[tuple[int, int, bytes]], i: int, end: int, ctx: _rd_Ctx, in_cell: bool
+) -> etree._Element | None:
+    payload = recs[i][2]
+    cid = payload[:4]
+    if cid in (_RD_CTRL_SECD, _RD_CTRL_COLD):
+        return None
+    if cid == _RD_CTRL_EQEDIT:
+        wrap = etree.Element("Control")
+        eq = etree.SubElement(wrap, "EqEdit")
+        for k in range(i + 1, end):
+            if recs[k][0] == _RD_HWPTAG_EQEDIT:
+                eq.set("script", _rd_eqedit_script(recs[k][2]))
+                break
+        return wrap
+    if cid == _RD_CTRL_TABLE:
+        return _rd_build_table(recs, i, end, ctx)
+    if cid == _RD_CTRL_GSO:
+        el = etree.Element("GShapeObjectControl")
+        _rd_paragraphs_in(recs, i + 1, end, ctx, in_cell, el)
+        return el
+    if cid == _RD_CTRL_FOOTER:
+        el = etree.Element("Footer")
+        _rd_paragraphs_in(recs, i + 1, end, ctx, in_cell, etree.SubElement(el, "FooterParagraphList"))
+        return el
+    if cid == _RD_CTRL_HEADER_:
+        el = etree.Element("Header")
+        _rd_paragraphs_in(recs, i + 1, end, ctx, in_cell, etree.SubElement(el, "HeaderParagraphList"))
+        return el
+    el = etree.Element("Control")
+    _rd_paragraphs_in(recs, i + 1, end, ctx, in_cell, el)
+    return el
+
+
+def _rd_build_table(recs: list[tuple[int, int, bytes]], i: int, end: int, ctx: _rd_Ctx) -> etree._Element:
+    lv = recs[i][1]
+    tbl = etree.Element("TableControl")
+    caption = None
+    row_sizes: list[int] | None = None
+    cells: list[tuple[tuple[int, int, int, int], etree._Element]] = []
+    cur: etree._Element | None = None
+    j = i + 1
+    while j < end:
+        tag, l2, pl = recs[j]
+        if l2 == lv + 1 and tag == _RD_HWPTAG_TABLE and row_sizes is None:
+            row_sizes = _rd_table_row_sizes(pl)
+            cur = None
+            j += 1
+            continue
+        if l2 == lv + 1 and tag == _RD_HWPTAG_LIST_HEADER:
+            if row_sizes is None:
+                caption = etree.Element("TableCaption")
+                cur = caption
+            else:
+                cell = etree.Element("TableCell")
+                col, row, cs, rs = _rd_cell_pos(pl)
+                cell.set("col", str(col))
+                cell.set("row", str(row))
+                cell.set("colspan", str(cs))
+                cell.set("rowspan", str(rs))
+                cells.append(((col, row, cs, rs), cell))
+                cur = cell
+            j += 1
+            continue
+        if tag == _RD_HWPTAG_PARA_HEADER:
+            if cur is None:
+                raise _RdError("표의 문단이 칸·캡션 머리 없이 나왔습니다")
+            p, j = _rd_build_paragraph(recs, j, ctx, cur.tag == "TableCell")
+            cur.append(p)
+            continue
+        j += 1
+    if row_sizes is None:
+        raise _RdError("표 레코드(TABLE)가 없습니다")
+    if sum(row_sizes) != len(cells):
+        raise _RdError(f"표의 칸 수({len(cells)})가 행별 칸 수 합({sum(row_sizes)})과 다릅니다")
+    if caption is not None:
+        tbl.append(caption)
+    body = etree.SubElement(tbl, "TableBody")
+    k = 0
+    for n in row_sizes:
+        row_el = etree.SubElement(body, "TableRow")
+        for _ in range(n):
+            row_el.append(cells[k][1])
+            k += 1
     return tbl
 
 
-def _eqedit_el(script: str) -> etree._Element:
-    el = etree.Element("EqEdit")
-    el.set("script", script)
-    return el
+# ---------------------------------------------------------------- 파일
 
 
-def _gso_el(text: str) -> etree._Element:
-    el = etree.Element("GShapeObjectControl")
-    if text:
-        t = etree.SubElement(el, "Text")
-        t.text = text
-    return el
+def _rd_fileheader_flags(header: bytes) -> int:
+    if len(header) < 40:
+        raise _RdError("FileHeader 가 짧습니다")
+    return struct.unpack_from("<I", header, 36)[0]
 
 
-def _split_level0_paras(recs: list[tuple[int, int, bytes]]) -> list[list[tuple[int, int, bytes]]]:
-    paras: list[list[tuple[int, int, bytes]]] = []
-    cur: list[tuple[int, int, bytes]] | None = None
-    for rec in recs:
-        tag, level, _payload = rec
-        if tag == _G_HWPTAG_PARA_HEADER and level == 0:
-            if cur is not None:
-                paras.append(cur)
-            cur = [rec]
-            continue
-        if cur is not None:
-            cur.append(rec)
-    if cur is not None:
-        paras.append(cur)
-    return paras
+def _rd_inflate(data: bytes, compressed: bool) -> bytes:
+    if not compressed:
+        return data
+    try:
+        return zlib.decompress(data, -15)
+    except zlib.error as e:
+        raise _RdError(f"압축을 풀 수 없습니다: {e}") from e
 
 
-def _ctrl_id(payload: bytes) -> bytes:
-    return payload[:4] if len(payload) >= 4 else b""
-
-
-def _emit_ctrl(
-    payload: bytes,
-    nested: list[tuple[int, int, bytes]],
-    tables: list[etree._Element],
-    table_i: list[int],
-) -> etree._Element | None:
-    cid = _ctrl_id(payload)
-    if cid == _G_CTRL_TABLE:
-        if table_i[0] >= len(tables):
-            raise _GateHwpError(
-                f"표 컨트롤 수보다 kordoc 표가 적습니다({len(tables)})"
-            )
-        el = tables[table_i[0]]
-        table_i[0] += 1
-        return el
-    if cid == _G_CTRL_GSO:
-        return _gso_el(_gso_text(nested))
-    if cid == _G_CTRL_EQEDIT:
-        script = ""
-        for tag, _lv, pl in nested:
-            if tag == _G_HWPTAG_EQEDIT:
-                script = _eqedit_script(pl)
-                break
-        return _eqedit_el(script)
-    return None
-
-
-def _fill_paragraph(
-    para: etree._Element,
-    body_recs: list[tuple[int, int, bytes]],
-    tables: list[etree._Element],
-    table_i: list[int],
-) -> None:
-    text_payloads = [pl for tag, lv, pl in body_recs if tag == _G_HWPTAG_PARA_TEXT and lv == 1]
-    headers: list[tuple[bytes, list[tuple[int, int, bytes]]]] = []
-    idx = 0
-    while idx < len(body_recs):
-        tag, lv, pl = body_recs[idx]
-        if tag == _G_HWPTAG_CTRL_HEADER and lv == 1:
-            nested, nxt = _nested(body_recs, idx, 1)
-            headers.append((pl, nested))
-            idx = nxt
-            continue
-        idx += 1
-
-    events: list[tuple[str, object]] = []
-    for pl in text_payloads:
-        events.extend(_para_events(pl))
-
-    hi = 0
-    for kind, val in events:
-        if kind == "text":
-            s = str(val)
-            if s:
-                el = etree.SubElement(para, "Text")
-                el.text = s
-            continue
-        if hi >= len(headers):
-            continue
-        hdr, nested = headers[hi]
-        hi += 1
-        child = _emit_ctrl(hdr, nested, tables, table_i)
-        if child is not None:
-            para.append(child)
-    while hi < len(headers):
-        hdr, nested = headers[hi]
-        hi += 1
-        child = _emit_ctrl(hdr, nested, tables, table_i)
-        if child is not None:
-            para.append(child)
-
-
-def _build_tables(
-    recs: list[tuple[int, int, bytes]], kordoc_tables: list[dict]
-) -> list[etree._Element]:
-    table_ctrls = 0
-    table_rows_rec: list[int | None] = []
-    i = 0
-    while i < len(recs):
-        tag, lv, pl = recs[i]
-        if tag == _G_HWPTAG_CTRL_HEADER and lv == 1 and _ctrl_id(pl) == _G_CTRL_TABLE:
-            table_ctrls += 1
-            nested, nxt = _nested(recs, i, 1)
-            nrows = None
-            for ntag, _nlv, npl in nested:
-                if ntag == _G_HWPTAG_TABLE:
-                    nrows = _table_n_rows(npl)
-                    break
-            table_rows_rec.append(nrows)
-            i = nxt
-            continue
-        i += 1
-    if table_ctrls != len(kordoc_tables):
-        raise _GateHwpError(
-            f"표 컨트롤 수({table_ctrls})와 kordoc 표 수({len(kordoc_tables)})가 다릅니다"
-        )
-    out: list[etree._Element] = []
-    for k, (tb, nrows) in enumerate(zip(kordoc_tables, table_rows_rec)):
-        krows = len(tb.get("cells") or [])
-        if nrows is not None and krows != nrows:
-            raise _GateHwpError(
-                f"{k + 1}번째 표 행 수가 다릅니다(레코드 {nrows} · kordoc {krows})"
-            )
-        out.append(_table_control_from_kordoc(tb))
-    return out
-
-
-def _read_section_streams(ole: object, compressed: bool) -> list[bytes]:
-    names = []
-    for path in ole.listdir():
-        if len(path) == 2 and path[0] == "BodyText" and str(path[1]).startswith("Section"):
-            names.append(path)
-    def _key(p: list) -> tuple[int, str]:
-        tail = str(p[1])[7:]
-        return (int(tail), str(p[1])) if tail.isdigit() else (10**9, str(p[1]))
-
-    names.sort(key=_key)
-    out: list[bytes] = []
-    for path in names:
-        raw = ole.openstream(path).read()
-        out.append(_decompress_stream(raw, compressed))
-    return out
-
-
-def _ole_kordoc_root(hwp_path: str | Path) -> etree._Element:
+def _rd_read_streams(hwp_path: str | Path) -> tuple[list[int], list[bytes]]:
+    """(글자 모양 속성 목록, 섹션 스트림 목록[압축 푼 것])."""
     import olefile
 
-    hwp_path = Path(hwp_path)
-    kdoc = _gate_run_kordoc(hwp_path)
-    ktables = _kordoc_tables(kdoc)
-    ole = olefile.OleFileIO(str(hwp_path))
+    path = str(hwp_path)
+    if not olefile.isOleFile(path):
+        raise _RdError("한글 5.0 파일이 아닙니다")
+    ole = olefile.OleFileIO(path)
     try:
-        header = ole.openstream("FileHeader").read()
-        compressed = _fileheader_compressed(header)
-        sections = _read_section_streams(ole, compressed)
+        if not ole.exists("FileHeader") or not ole.exists("DocInfo"):
+            raise _RdError("한글 5.0 파일이 아닙니다(FileHeader·DocInfo 없음)")
+        flags = _rd_fileheader_flags(ole.openstream("FileHeader").read())
+        if flags & 0b10:
+            raise _RdError("암호가 걸린 한글 파일은 읽을 수 없습니다")
+        compressed = bool(flags & 1)
+        props = _rd_char_shape_props(_rd_iter_records(_rd_inflate(ole.openstream("DocInfo").read(), compressed)))
+        names: list[tuple[int, str]] = []
+        for entry in ole.listdir():
+            if len(entry) == 2 and entry[0] == "BodyText" and entry[1].startswith("Section"):
+                tail = entry[1][7:]
+                if tail.isdigit():
+                    names.append((int(tail), "/".join(entry)))
+        names.sort()
+        sections = [_rd_inflate(ole.openstream(nm).read(), compressed) for _i, nm in names]
     finally:
-        close = getattr(ole, "close", None)
-        if callable(close):
-            close()
+        ole.close()
+    if not sections:
+        raise _RdError("BodyText 섹션이 없습니다")
+    return props, sections
 
+
+def _rd_root_from_streams(props: list[int], sections: list[bytes]) -> etree._Element:
+    """글자 모양 속성 목록과 압축을 푼 섹션 스트림들로 나무를 만든다."""
+    ctx = _rd_Ctx(props)
     root = etree.Element("HwpDoc")
     body = etree.SubElement(root, "BodyText")
-    if not sections:
-        raise _GateHwpError("BodyText 섹션이 없습니다")
-
     for sec_i, data in enumerate(sections):
-        recs = _gate_iter_records(data)
-        tables = _build_tables(recs, ktables if sec_i == 0 else [])
-        if sec_i > 0 and any(
-            tag == _G_HWPTAG_CTRL_HEADER and lv == 1 and _ctrl_id(pl) == _G_CTRL_TABLE
-            for tag, lv, pl in recs
-        ):
-            # 표는 문서 순서로 한 목록. 섹션이 둘이면 이어 쓴다.
-            raise _GateHwpError("표가 있는 섹션이 둘 이상입니다")
-        table_i = [0]
+        recs = _rd_iter_records(data)
         section = etree.SubElement(body, "SectionDef")
         section.set("section-id", str(sec_i))
         width, height = 0, 0
         for tag, _lv, pl in recs:
-            if tag == _G_HWPTAG_PAGE_DEF:
-                width, height = _page_def_size(pl)
+            if tag == _RD_HWPTAG_PAGE_DEF:
+                width, height = _rd_page_def_size(pl)
                 break
         page = etree.SubElement(section, "PageDef")
         page.set("width", str(width))
         page.set("height", str(height))
         colset = etree.SubElement(section, "ColumnSet")
-        for para_recs in _split_level0_paras(recs):
-            para = etree.SubElement(colset, "Paragraph")
-            _fill_paragraph(para, para_recs, tables, table_i)
-        if table_i[0] != len(tables) and sec_i == 0:
-            raise _GateHwpError(
-                f"표 컨트롤을 다 붙이지 못했습니다({table_i[0]}/{len(tables)})"
-            )
+        j = 0
+        while j < len(recs):
+            if recs[j][0] == _RD_HWPTAG_PARA_HEADER and recs[j][1] == 0:
+                p, j = _rd_build_paragraph(recs, j, ctx, False)
+                colset.append(p)
+            else:
+                j += 1
     return root
 
 
+def _rd_hwp_to_root(hwp_path: str | Path) -> etree._Element:
+    props, sections = _rd_read_streams(hwp_path)
+    return _rd_root_from_streams(props, sections)
+
+
 def _hwp_to_root(hwp_path: str | Path, warnings: list[str] | None = None) -> etree._Element:
-    return _ole_kordoc_root(hwp_path)
+    return _rd_hwp_to_root(hwp_path)
 
 
 def _fix_noop(s: str) -> str:
@@ -799,8 +845,13 @@ def _compact(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
 
-def _collapse_ws(s: str | None) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+def _join_cell_lines(s: str | None) -> str:
+    """원문 칸 줄을 잇는다. 윗줄이 「/」로 끝나면 빈칸 없이, 아니면 빈칸 하나로. 연속 공백은 하나로, 앞뒤는 뗀다."""
+    lines = (s or "").split("\n")
+    out = lines[0]
+    for ln in lines[1:]:
+        out += ("" if out.endswith("/") else " ") + ln
+    return re.sub(r"\s+", " ", out).strip()
 
 
 def _raw_fields(rec: dict) -> list[str]:
@@ -929,13 +980,13 @@ def _field_gates(records: list[dict], subheaders: list[dict]) -> dict[str, list[
         if exp_unit != rec.get("unit_norm"):
             mism["unit_norm"] = {"expected": exp_unit, "actual": rec.get("unit_norm"), "unit": rec.get("unit")}
         if not rec.get("name_inherited"):
-            exp_name = _collapse_ws(rec.get("name_raw"))
+            exp_name = _join_cell_lines(rec.get("name_raw"))
             if exp_name != (rec.get("name") or ""):
                 mism["name"] = {"expected": exp_name, "actual": rec.get("name"), "raw": rec.get("name_raw")}
         spec_raw = rec.get("spec_raw")
         if spec_raw is not None:
             spec_raw_s = str(spec_raw)
-            exp_spec = _collapse_ws(spec_raw_s) if spec_raw_s.strip() else spec_raw_s.strip()
+            exp_spec = _join_cell_lines(spec_raw_s) if spec_raw_s.strip() else spec_raw_s.strip()
             if exp_spec != (rec.get("spec") or ""):
                 mism["spec"] = {"expected": exp_spec, "actual": rec.get("spec"), "raw": rec.get("spec_raw")}
         if mism:

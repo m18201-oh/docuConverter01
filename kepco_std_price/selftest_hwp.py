@@ -736,64 +736,126 @@ def run_all() -> Check:
     c.check("K1 S3 일반 줄바꿈은 빈칸", _hwp_join_cell_lines("콘크리트\n타설") == "콘크리트 타설")
     c.check("K1 S4 연속 / 줄바꿈", _hwp_join_cell_lines("가/\n나/\n다") == "가/나/다")
 
-    from .hwp_records import (
-        HwpReadError,
-        NODE_REQUIRED_MSG,
-        parse_para_text,
-        parse_record_header,
-        rewrite_cell_markup,
+    # ---- 한글 원본 레코드 직접 읽기 (G10 A): 만든 바이트열로 시험한다 ----
+    import struct
+
+    from . import conservation_hwp as _gate
+    from . import hwp_records as hr
+
+    def rec(tag: int, level: int, payload: bytes) -> bytes:
+        size = len(payload)
+        if size >= 0xFFF:
+            return struct.pack("<II", tag | (level << 10) | (0xFFF << 20), size) + payload
+        return struct.pack("<I", tag | (level << 10) | (size << 20)) + payload
+
+    def u16(s: str) -> bytes:
+        return s.encode("utf-16le")
+
+    SUP = 1 << 15
+    SUB = 1 << 16
+
+    # K2: 위 첨자 글자 모양 → 표 칸 안의 2·3 은 ²·³, 표 밖은 그대로
+    def para(level: int, text: str, shapes: list[tuple[int, int]]) -> bytes:
+        return (
+            rec(hr.HWPTAG_PARA_HEADER, level, b"\x00" * 24)
+            + rec(hr.HWPTAG_PARA_TEXT, level + 1, u16(text + "\r"))
+            + rec(
+                hr.HWPTAG_PARA_CHAR_SHAPE,
+                level + 1,
+                b"".join(struct.pack("<II", pos, sid) for pos, sid in shapes),
+            )
+            + rec(hr.HWPTAG_PARA_LINE_SEG, level + 1, struct.pack("<I", 0) + b"\x00" * 32)
+        )
+
+    def table_para(cell_texts: list[tuple[str, list[tuple[int, int]]]]) -> bytes:
+        # 최상위 문단 하나 + 표 컨트롤(행 하나, 칸 여럿)
+        n = len(cell_texts)
+        out = rec(hr.HWPTAG_PARA_HEADER, 0, b"\x00" * 24)
+        out += rec(hr.HWPTAG_PARA_TEXT, 1, u16(chr(11) + "\x00" * 7 + "\r"))
+        out += rec(hr.HWPTAG_PARA_CHAR_SHAPE, 1, struct.pack("<II", 0, 0))
+        out += rec(hr.HWPTAG_PARA_LINE_SEG, 1, struct.pack("<I", 0) + b"\x00" * 32)
+        out += rec(hr.HWPTAG_CTRL_HEADER, 1, b" lbt" + b"\x00" * 42)
+        out += rec(
+            hr.HWPTAG_TABLE,
+            2,
+            struct.pack("<IHHH", 0, 1, n, 0) + b"\x00" * 8 + struct.pack("<H", n) + struct.pack("<H", 0),
+        )
+        for col, (text, shapes) in enumerate(cell_texts):
+            out += rec(
+                hr.HWPTAG_LIST_HEADER,
+                2,
+                struct.pack("<HIH", 1, 0, 0) + struct.pack("<HHHH", col, 0, 1, 1) + b"\x00" * 14,
+            )
+            out += para(2, text, shapes)
+        return out
+
+    top = para(0, "m2", [(0, 0), (1, 1)])
+    tbl = table_para([("m2", [(0, 0), (1, 1)]), ("m3 4", [(0, 0), (1, 1), (2, 0)])])
+    # 표 칸 안: "m2" 의 2 만 위 첨자, "m3 4" 의 3 만 위 첨자
+    root = hr.root_from_streams([0, SUP], [top + tbl])
+    nodes_top = [t.text for t in root.find("BodyText/SectionDef/ColumnSet")[0].iter("Text")]
+    cells = root.findall(".//TableCell")
+    cell_txt = ["".join(x.itertext()) for x in cells]
+    c.check("K2 표 밖 위 첨자는 그대로", nodes_top == ["m", "2"], repr(nodes_top))
+    c.check("K2 표 칸 위 첨자 2·3 은 ²·³", cell_txt == ["m²", "m³ 4"], repr(cell_txt))
+    c.check(
+        "K2 칸 위치(열·행·병합)를 읽는다",
+        [(x.get("col"), x.get("row"), x.get("colspan"), x.get("rowspan")) for x in cells]
+        == [("0", "0", "1", "1"), ("1", "0", "1", "1")],
+    )
+    gate_root = _gate._rd_root_from_streams([0, SUP], [top + tbl])
+    c.check(
+        "K2 검사기 쪽 읽기 사본도 같은 나무",
+        etree.tostring(gate_root) == etree.tostring(root),
     )
 
-    k2a = rewrite_cell_markup("m<sup>2</sup>")
-    k2b = rewrite_cell_markup("m<sup>3</sup>")
-    k2c = rewrite_cell_markup("\\$5")
-    c.check("K2 칸 글 표기", (k2a, k2b, k2c) == ("m²", "m³", "$5"), repr((k2a, k2b, k2c)))
-    k3_err = False
-    try:
-        rewrite_cell_markup("x<sub>1</sub>")
-    except HwpReadError:
-        k3_err = True
-    c.check("K3 sub 표기는 오류", k3_err)
+    def read_err(props: list[int], data: bytes) -> bool:
+        try:
+            hr.root_from_streams(props, [data])
+        except hr.HwpReadError:
+            return True
+        return False
 
-    h = 66 | (1 << 10) | (0xFFF << 20)
+    # K3: 표 칸 안의 아래 첨자·2·3 말고 다른 위 첨자는 멈춘다(표 밖은 상관없다)
+    c.check(
+        "K3 표 칸 아래 첨자는 오류",
+        read_err([0, SUB], table_para([("x1", [(0, 0), (1, 1)])])),
+    )
+    c.check(
+        "K3 표 칸 2·3 아닌 위 첨자는 오류",
+        read_err([0, SUP], table_para([("m4", [(0, 0), (1, 1)])])),
+    )
+    c.check(
+        "K3 표 밖 아래 첨자는 오류 아님",
+        not read_err([0, SUB], para(0, "x1", [(0, 0), (1, 1)])),
+    )
+
+    h = hr.HWPTAG_PARA_HEADER | (1 << 10) | (0xFFF << 20)
     rec_bytes = h.to_bytes(4, "little") + (4096).to_bytes(4, "little") + b"\x00" * 8
-    tag, level, size, payload_off = parse_record_header(rec_bytes, 0)
+    tag, level, size, payload_off = hr.parse_record_header(rec_bytes, 0)
     c.check(
         "K4 레코드 머리 0xFFF",
         (tag, level, size, payload_off) == (66, 1, 4096, 8),
         repr((tag, level, size, payload_off)),
     )
+    big = rec(hr.HWPTAG_PARA_TEXT, 1, b"\x41\x00" * 3000)
+    recs_big = hr.iter_records(big + rec(hr.HWPTAG_PARA_HEADER, 0, b"\x00" * 24))
+    c.check(
+        "K4 큰 레코드 뒤 레코드도 읽는다",
+        [(t, lv, len(p)) for t, lv, p in recs_big] == [(67, 1, 6000), (66, 0, 24)],
+    )
 
-    body = "가" + chr(11) + "\0" * 7 + "나" + chr(13)
-    payload = body.encode("utf-16le")
-    text, nctrl = parse_para_text(payload)
-    c.check("K5 PARA_TEXT 풀기", (text, nctrl) == ("가나", 1), repr((text, nctrl)))
+    body = "가" + chr(11) + "\0" * 7 + "나" + chr(9) + "\0" * 7 + "다" + chr(10) + chr(13)
+    text, nctrl = hr.parse_para_text(body.encode("utf-16le"))
+    c.check("K5 PARA_TEXT 풀기", (text, nctrl) == ("가나다", 1), repr((text, nctrl)))
 
-    import io
-    import os
-    from contextlib import redirect_stderr
-
-    from .cli import main as cli_main
-
-    with tempfile.TemporaryDirectory(prefix="g10_k6_") as tmp:
-        tmp_p = Path(tmp)
-        missing_node = str(tmp_p / "no_such_node")
-        old = os.environ.get("KEPCO_NODE")
-        os.environ["KEPCO_NODE"] = missing_node
-        buf = io.StringIO()
-        try:
-            with redirect_stderr(buf):
-                code = cli_main(
-                    ["--hwp", str(tmp_p / "x.hwp"), "--half", "2026H1", "--out", str(tmp_p / "out")]
-                )
-        finally:
-            if old is None:
-                os.environ.pop("KEPCO_NODE", None)
-            else:
-                os.environ["KEPCO_NODE"] = old
-        err = buf.getvalue().strip()
-        c.check("K6 Node 없음 종료 코드 2", code == 2, str(code))
-        c.check("K6 Node 없음 안내", err == NODE_REQUIRED_MSG, repr(err))
+    # K6: 확장 컨트롤 수와 CTRL_HEADER 수가 다르면 멈춘다
+    broken = (
+        rec(hr.HWPTAG_PARA_HEADER, 0, b"\x00" * 24)
+        + rec(hr.HWPTAG_PARA_TEXT, 1, u16(chr(11) + "\x00" * 7 + "\r"))
+        + rec(hr.HWPTAG_PARA_CHAR_SHAPE, 1, struct.pack("<II", 0, 0))
+    )
+    c.check("K6 컨트롤 수가 안 맞으면 오류", read_err([0], broken))
 
     return c
 

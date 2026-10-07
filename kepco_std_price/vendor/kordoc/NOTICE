@@ -1,9 +1,0 @@
-kepco_std_price/vendor/kordoc — 한글(.hwp) 읽기 엔진 동봉본
-
-1. kordoc 4.19.0 — MIT License, Copyright (c) 2026 chrisryugj (https://github.com/chrisryugj/kordoc)
-   kordoc_bundle.mjs 에 의존 패키지와 함께 한 파일로 묶어(esbuild) 동봉한다. 원문 라이선스: LICENSE
-   묶여 들어간 패키지와 라이선스 원문: THIRD_PARTY_LICENSES.txt
-   (MIT · ISC · BSD-2-Clause · Apache-2.0(cfb) · MIT AND Zlib(pako) · jszip 은 MIT 로 이용)
-   kordoc 의 NOTICE(Apache-2.0 파생 코드 고지)와 THIRD_PARTY 원문도 THIRD_PARTY_LICENSES.txt 에 그대로 옮겼다.
-   PDF 부품(pdfjs-dist)은 빈 대역(src/pdfjs_stub)으로 바꿔 동봉하지 않는다.
-2. 묶는 방법과 원본: BUILD.md · src/

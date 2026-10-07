@@ -1,6 +1,6 @@
 """HWP 5 바이너리 → 한전 표준시장단가 레코드/그룹/소제목/쪽.
 
-표는 동봉 kordoc 구조 JSON, 문단 번호·본문·수식 원문은 olefile 로 한글 원본을 직접 읽는다.
+표·문단·수식 원문 모두 olefile 로 한글 원본의 레코드를 직접 읽어(`hwp_records`) 나무를 만든다.
 한컴 COM 은 쓰지 않는다. PDF 경로(`extract.py`)의 추출 함수를 부르지 않는다.
 """
 from __future__ import annotations
@@ -547,12 +547,9 @@ def _merge_note_continuations(notes: list[dict]) -> list[dict]:
 
 
 def _hwp_to_root(hwp_path: str | Path, warnings: list[str] | None = None) -> etree._Element:
-    from .hwp_records import HwpReadError, hwp_to_root
+    from .hwp_records import hwp_to_root
 
-    try:
-        return hwp_to_root(hwp_path)
-    except HwpReadError:
-        raise
+    return hwp_to_root(hwp_path)
 
 
 def _anchor(section: int, para_index: int, table_index: int | None, row: int | None) -> dict:
