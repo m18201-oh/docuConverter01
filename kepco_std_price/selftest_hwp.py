@@ -723,6 +723,19 @@ def run_all() -> Check:
     )
     c.check("제6 table_title 키가 table_seq 바로 뒤에 있다", key_ok, str(keys_tt1[0] if keys_tt1 else None))
 
+    from .extract_hwp import _join_cell_lines as _hwp_join_cell_lines
+
+    c.check(
+        "K1 S1 / 줄바꿈은 빈칸 없이",
+        _hwp_join_cell_lines("쉬트파일박기/진동식/\n(N≦15)") == "쉬트파일박기/진동식/(N≦15)",
+    )
+    c.check(
+        "K1 S2 / 뒤 빈칸은 유지",
+        _hwp_join_cell_lines("쉬트파일박기/진동식/ \n(N≦15)") == "쉬트파일박기/진동식/ (N≦15)",
+    )
+    c.check("K1 S3 일반 줄바꿈은 빈칸", _hwp_join_cell_lines("콘크리트\n타설") == "콘크리트 타설")
+    c.check("K1 S4 연속 / 줄바꿈", _hwp_join_cell_lines("가/\n나/\n다") == "가/나/다")
+
     from .hwp_records import (
         HwpReadError,
         NODE_REQUIRED_MSG,

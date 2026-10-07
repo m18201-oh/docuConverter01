@@ -227,6 +227,14 @@ def _collapse(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _join_cell_lines(raw: str) -> str:
+    lines = raw.split("\n")
+    out = lines[0] if lines else ""
+    for ln in lines[1:]:
+        out += ("" if out.endswith("/") else " ") + ln
+    return re.sub(r"\s+", " ", out).strip()
+
+
 def _is_inherit(s: str) -> bool:
     t = re.sub(r"\s+", "", s)
     return bool(t) and all(c in INHERIT_CHARS for c in t)
@@ -777,10 +785,10 @@ def extract_from_root(
                         f"명칭 상속 실패(이어받을 명칭 없음): code={code} half={half} name_raw={name_raw!r}"
                     )
             else:
-                name = _collapse(name_raw)
+                name = _join_cell_lines(name_raw)
                 prev_name = name
 
-            spec = _collapse(spec_raw) if spec_raw.strip() else spec_raw.strip()
+            spec = _join_cell_lines(spec_raw) if spec_raw.strip() else spec_raw.strip()
 
             if status == "present" and price is None and "폐지" not in (price_tok or ""):
                 raw_keep = (price_tok or price_raw or "").strip()
