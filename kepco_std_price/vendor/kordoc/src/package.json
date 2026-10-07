@@ -1,0 +1,12 @@
+{
+  "name": "hwp-hwpx-reader-engine-build",
+  "private": true,
+  "description": "kordoc_bundle.mjs 를 다시 만들 때만 쓴다(BUILD.md)",
+  "type": "module",
+  "dependencies": {
+    "kordoc": "4.19.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.x"
+  }
+}

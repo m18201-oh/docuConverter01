@@ -58,10 +58,10 @@ def main(argv: list[str] | None = None) -> int:
     source_path = Path(args.hwp) if args.hwp else Path(args.pdf)
     try:
         if args.hwp:
-            try:
-                from hwp5.xmlmodel import Hwp5File  # noqa: F401
-            except ImportError:
-                print("uv sync --extra hwp 필요", file=sys.stderr)
+            from .hwp_records import NODE_REQUIRED_MSG, node_ok
+
+            if not node_ok():
+                print(NODE_REQUIRED_MSG, file=sys.stderr)
                 return 2
             from .extract_hwp import extract_hwp
 

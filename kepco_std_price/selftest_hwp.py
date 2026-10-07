@@ -723,6 +723,65 @@ def run_all() -> Check:
     )
     c.check("제6 table_title 키가 table_seq 바로 뒤에 있다", key_ok, str(keys_tt1[0] if keys_tt1 else None))
 
+    from .hwp_records import (
+        HwpReadError,
+        NODE_REQUIRED_MSG,
+        parse_para_text,
+        parse_record_header,
+        rewrite_cell_markup,
+    )
+
+    k2a = rewrite_cell_markup("m<sup>2</sup>")
+    k2b = rewrite_cell_markup("m<sup>3</sup>")
+    k2c = rewrite_cell_markup("\\$5")
+    c.check("K2 칸 글 표기", (k2a, k2b, k2c) == ("m²", "m³", "$5"), repr((k2a, k2b, k2c)))
+    k3_err = False
+    try:
+        rewrite_cell_markup("x<sub>1</sub>")
+    except HwpReadError:
+        k3_err = True
+    c.check("K3 sub 표기는 오류", k3_err)
+
+    h = 66 | (1 << 10) | (0xFFF << 20)
+    rec_bytes = h.to_bytes(4, "little") + (4096).to_bytes(4, "little") + b"\x00" * 8
+    tag, level, size, payload_off = parse_record_header(rec_bytes, 0)
+    c.check(
+        "K4 레코드 머리 0xFFF",
+        (tag, level, size, payload_off) == (66, 1, 4096, 8),
+        repr((tag, level, size, payload_off)),
+    )
+
+    body = "가" + chr(11) + "\0" * 7 + "나" + chr(13)
+    payload = body.encode("utf-16le")
+    text, nctrl = parse_para_text(payload)
+    c.check("K5 PARA_TEXT 풀기", (text, nctrl) == ("가나", 1), repr((text, nctrl)))
+
+    import io
+    import os
+    from contextlib import redirect_stderr
+
+    from .cli import main as cli_main
+
+    with tempfile.TemporaryDirectory(prefix="g10_k6_") as tmp:
+        tmp_p = Path(tmp)
+        missing_node = str(tmp_p / "no_such_node")
+        old = os.environ.get("KEPCO_NODE")
+        os.environ["KEPCO_NODE"] = missing_node
+        buf = io.StringIO()
+        try:
+            with redirect_stderr(buf):
+                code = cli_main(
+                    ["--hwp", str(tmp_p / "x.hwp"), "--half", "2026H1", "--out", str(tmp_p / "out")]
+                )
+        finally:
+            if old is None:
+                os.environ.pop("KEPCO_NODE", None)
+            else:
+                os.environ["KEPCO_NODE"] = old
+        err = buf.getvalue().strip()
+        c.check("K6 Node 없음 종료 코드 2", code == 2, str(code))
+        c.check("K6 Node 없음 안내", err == NODE_REQUIRED_MSG, repr(err))
+
     return c
 
 
