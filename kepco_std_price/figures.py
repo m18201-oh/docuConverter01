@@ -20,6 +20,8 @@ SPLIT_GAP_PT = 40.0
 CLIP_PAD_PT = 2.0
 PNG_DPI = 200
 INK_THR = 253
+MIN_REGION_PT = 5.0
+Y_SAME_PT = 2.0
 
 HEADER_WORDS = {"공종코드", "공종명칭", "규격", "단위", "단가", "노무비율", "비고"}
 RE_PAGENO = re.compile(r"^[-–]?\d+[-–]?$")
@@ -27,6 +29,9 @@ RE_BANNER = re.compile(r"^대분류[A-Z가-힣]?([,，][A-Z가-힣])*$")
 RE_INDEXCODE = re.compile(r"^n[A-Z]{2}\d{3}\.\d{5}")
 RE_LABEL = re.compile(r"^[【\[]단가정의[】\]]$")
 RE_SPACE = re.compile(r"[\s\u200b\ufeff\u00a0\ue000-\uf8ff]+")
+RE_CODE_ONLY = re.compile(r"^[A-Z]{2}\d{3}\.\d{5}$")
+RE_CODE_IN = re.compile(r"[A-Z]{2}\d{3}\.\d{5}")
+RE_HANGUL4 = re.compile(r"[가-힣]{4}")
 
 RAW_KEYS = (
     "fig_id",
@@ -48,6 +53,203 @@ RAW_KEYS = (
 
 def compact(s: str | None) -> str:
     return RE_SPACE.sub("", s or "")
+
+
+def is_figure_title_text(c: str) -> bool:
+    """그림 제목 꼴: [표준도] · [그림 · <사례 · <… 상세도> 등."""
+    return bool(c) and c[0] in "[<("
+
+
+def record_index(records: list[dict] | None) -> tuple[dict[str, list[tuple[str, str]]], set[str], set[str]]:
+    codes: dict[str, list[tuple[str, str]]] = {}
+    prices: set[str] = set()
+    labors: set[str] = set()
+    for rc in records or []:
+        code = compact(rc.get("code") or "")
+        pr = compact(rc.get("price_raw") or "")
+        lb = compact(rc.get("labor_raw") or "")
+        if code:
+            codes.setdefault(code, []).append((pr, lb))
+        if pr:
+            prices.add(pr)
+        if lb:
+            labors.add(lb)
+    return codes, prices, labors
+
+
+def note_compacts(groups: list[dict] | None) -> list[str]:
+    out: list[str] = []
+    for g in groups or []:
+        for n in g.get("notes") or []:
+            c = compact(n.get("item") or "")
+            if c:
+                out.append(c)
+    return out
+
+
+def line_is_header(c: str) -> bool:
+    if not c:
+        return False
+    if c.startswith("■"):
+        return True
+    if RE_LABEL.match(c):
+        return True
+    if RE_BANNER.match(c):
+        return True
+    if RE_PAGENO.match(c):
+        return True
+    return False
+
+
+def line_is_note_sentence(c: str, notes: list[str]) -> bool:
+    if not c or is_figure_title_text(c):
+        return False
+    if len(c) < 10 or not RE_HANGUL4.search(c):
+        return False
+    return any(c in n for n in notes)
+
+
+def line_is_amount_cell(c: str, prices: set[str], labors: set[str]) -> bool:
+    """칸 전체가 단가·노무비율이거나, 단가와 노무비율이 한 덩어리로 붙은 줄."""
+    if not c:
+        return False
+    if c in prices or c in labors:
+        return True
+    for pr in prices:
+        if pr and c.startswith(pr):
+            rest = c[len(pr):]
+            if not rest or rest in labors:
+                return True
+    for lb in labors:
+        if lb and c.startswith(lb):
+            rest = c[len(lb):]
+            if not rest or rest in prices:
+                return True
+    return False
+
+
+def line_is_table_cell(
+    c: str,
+    peer_compacts: set[str],
+    codes: dict[str, list[tuple[str, str]]],
+    prices: set[str],
+    labors: set[str],
+) -> bool:
+    """C-1: 단가·노무비율 칸, 또는 같은 줄/같은 높이(±2pt)에 단가가 있는 공종코드.
+
+    공종코드만 있는 줄은 도해 라벨로 남긴다.
+    """
+    if not c:
+        return False
+    if c in HEADER_WORDS:
+        return True
+    if line_is_amount_cell(c, prices, labors):
+        return True
+    if RE_CODE_ONLY.match(c):
+        for pr, lb in codes.get(c) or []:
+            prs = {pr} if pr else set()
+            lbs = {lb} if lb else set()
+            if any(line_is_amount_cell(p, prs, lbs) for p in peer_compacts):
+                return True
+        return False
+    m = RE_CODE_IN.search(c)
+    if m:
+        rest = c[m.end():] or c[: m.start()]
+        if line_is_amount_cell(rest, prices, labors) or line_is_amount_cell(c[: m.start()] + c[m.end():], prices, labors):
+            return True
+    return False
+
+
+def c_exclude_reason(
+    compact_text: str,
+    peer_compacts: set[str],
+    codes: dict[str, list[tuple[str, str]]],
+    prices: set[str],
+    labors: set[str],
+    notes: list[str],
+) -> str | None:
+    """C-1 table / C-2 note / C-3 header. None 이면 그림 후보."""
+    c = compact_text
+    if line_is_header(c):
+        return "header"
+    if line_is_note_sentence(c, notes):
+        return "note"
+    if line_is_table_cell(c, peer_compacts, codes, prices, labors):
+        return "table"
+    return None
+
+
+def region_is_junk(box, items) -> bool:
+    """D: 5pt 미만, 빈 영역, 그림 제목 꼴이 아닌 글 조각."""
+    if (box[2] - box[0]) < MIN_REGION_PT or (box[3] - box[1]) < MIN_REGION_PT:
+        return True
+    n_img = sum(1 for it in items if it.get("kind") == "img")
+    n_draw = sum(1 for it in items if it.get("kind") == "draw")
+    texts = [it for it in items if it.get("kind") in ("text", "diagram_label")]
+    if n_img == 0 and n_draw == 0:
+        if not texts:
+            return True
+        if not all(is_figure_title_text(compact(it.get("text") or "")) for it in texts):
+            return True
+    return False
+
+
+def _merge_y_bands(bands: list[list[float]]) -> list[list[float]]:
+    if not bands:
+        return []
+    bands = sorted(bands)
+    out = [list(bands[0])]
+    for a, b in bands[1:]:
+        if a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def split_region_excluded(r: dict, y_tol: float = Y_SAME_PT) -> list[dict]:
+    """C-5: 뺀 줄 띠로 영역을 나누고, 남은 항목으로 상자를 다시 정한다."""
+    box = r["box"]
+    bands: list[list[float]] = []
+    for eb in r.get("excluded_boxes") or []:
+        if eb[2] < box[0] or eb[0] > box[2]:
+            continue
+        if eb[3] < box[1] or eb[1] > box[3]:
+            continue
+        bands.append([eb[1] - y_tol, eb[3] + y_tol])
+    bands = _merge_y_bands(bands)
+    if not bands:
+        return [r]
+    slices: list[list[float]] = []
+    y = box[1]
+    for a, b in bands:
+        a = max(a, box[1])
+        b = min(b, box[3])
+        if a - y >= 0.01:
+            slices.append([box[0], y, box[2], a])
+        y = max(y, b)
+    if box[3] - y >= 0.01:
+        slices.append([box[0], y, box[2], box[3]])
+    out: list[dict] = []
+    for sl in slices:
+        items = []
+        for it in r["items"]:
+            ib = it["box"]
+            ix0, iy0 = max(ib[0], sl[0]), max(ib[1], sl[1])
+            ix1, iy1 = min(ib[2], sl[2]), min(ib[3], sl[3])
+            if ix1 - ix0 > 0.01 and iy1 - iy0 > 0.01:
+                nit = dict(it)
+                nit["box"] = [ix0, iy0, ix1, iy1]
+                items.append(nit)
+        if not items:
+            continue
+        nb = union([it["box"] for it in items])
+        nb = [max(nb[0], sl[0]), max(nb[1], sl[1]), min(nb[2], sl[2]), min(nb[3], sl[3])]
+        rr = dict(r)
+        rr["box"] = nb
+        rr["items"] = items
+        out.append(rr)
+    return out
 
 
 def inter(a, b):
@@ -130,16 +332,6 @@ def match_groups_by_codes(
     return out
 
 
-def _hwp_tokens(records: list[dict]) -> set[str]:
-    toks: set[str] = set()
-    for rc in records:
-        for k in ("code", "price_raw", "labor_raw"):
-            v = compact(rc.get(k) or "")
-            if len(v) >= 4:
-                toks.add(v)
-    return toks
-
-
 def _build_S(g: dict):
     s = ""
     items = []
@@ -190,7 +382,9 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
     sub_state = None
     stats = collections.Counter()
     col_info: dict = {}
-    hwp_toks = _hwp_tokens(hwp_records) if hwp_records else set()
+    recs_for_c = hwp_records if hwp_records else records
+    codes_idx, prices_idx, labors_idx = record_index(recs_for_c)
+    notes_idx = note_compacts(groups)
 
     for (pno, half) in cols:
         page = doc[pno - 1]
@@ -370,50 +564,53 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
             if k == "remain" and any(0 < hy - l["box"][3] <= 28 for hy in table_hy):
                 cls[i] = (l, "subcap")
 
-        if hwp_toks:
-            re_code_only = re.compile(r"^[A-Z]{2}\d{3}\.\d{5}$")
-            token_idx = []
-            for i, (l, k) in enumerate(cls):
-                if k != "remain":
-                    continue
-                if any(t and t in l["c"] for t in hwp_toks):
-                    token_idx.append(i)
+        def _yc_box(b):
+            return (b[1] + b[3]) / 2
 
-            def _yc(i):
-                b = cls[i][0]["box"]
-                return (b[1] + b[3]) / 2
-
-            table_idx: set[int] = set()
-            diagram_idx: set[int] = set()
-            for i in token_idx:
-                row = [
-                    j
-                    for j, (_l, k) in enumerate(cls)
-                    if k == "remain" and abs(_yc(j) - _yc(i)) < 5
-                ]
-                row_has_price = False
-                for j in row:
-                    c = cls[j][0]["c"]
-                    for t in hwp_toks:
-                        if t and t in c and not re_code_only.match(t) and not re_code_only.match(c):
-                            row_has_price = True
-                            break
-                if re_code_only.match(cls[i][0]["c"]) and not row_has_price:
-                    diagram_idx.add(i)
+        all_line_yc = [(_yc_box(l["box"]), l["c"]) for l, _k in cls]
+        c_boxes: list = []
+        for i, (l, k) in enumerate(cls):
+            yc = _yc_box(l["box"])
+            peers = {c for yc2, c in all_line_yc if abs(yc2 - yc) <= Y_SAME_PT}
+            reason = c_exclude_reason(l["c"], peers, codes_idx, prices_idx, labors_idx, notes_idx)
+            if reason:
+                eb = list(l["box"])
+                if l["c"] in HEADER_WORDS:
+                    eb[1] -= 24.0
+                c_boxes.append(eb)
+            if k != "remain":
+                continue
+            if reason == "table":
+                cls[i] = (l, "table")
+                lb = l["box"]
+                pad_top = 24.0 if l["c"] in HEADER_WORDS else 4.0
+                table_boxes.append([lb[0] - 4, lb[1] - pad_top, lb[2] + 4, lb[3] + 4])
+                if l["c"] in HEADER_WORDS:
+                    c_boxes.append([lb[0], lb[1] - pad_top, lb[2], lb[3]])
+            elif reason == "note":
+                cls[i] = (l, "note")
+            elif reason == "header":
+                if l["c"].startswith("■"):
+                    cls[i] = (l, "title")
+                elif RE_LABEL.match(l["c"]):
+                    cls[i] = (l, "label")
+                elif RE_BANNER.match(l["c"]):
+                    cls[i] = (l, "banner")
                 else:
-                    table_idx.add(i)
-                    table_idx.update(row)
-            for i, (l, k) in enumerate(cls):
-                if k == "remain" and l["c"] in HEADER_WORDS:
-                    table_idx.add(i)
-            for i in table_idx:
-                cls[i] = (cls[i][0], "table")
-                lb = cls[i][0]["box"]
+                    cls[i] = (l, "pageno")
+            elif RE_CODE_ONLY.match(l["c"]):
+                cls[i] = (l, "diagram_label")
+        table_yc = [_yc_box(l["box"]) for l, k in cls if k == "table"]
+        for i, (l, k) in enumerate(cls):
+            if k != "remain":
+                continue
+            yc = _yc_box(l["box"])
+            if any(abs(yc - tyc) <= Y_SAME_PT for tyc in table_yc):
+                cls[i] = (l, "table")
+                c_boxes.append(l["box"])
+                lb = l["box"]
                 table_boxes.append([lb[0] - 4, lb[1] - 4, lb[2] + 4, lb[3] + 4])
-            for i in diagram_idx:
-                cls[i] = (cls[i][0], "table")
-                lb = cls[i][0]["box"]
-                table_boxes.append([lb[0] - 2, lb[1] - 2, lb[2] + 2, lb[3] + 2])
+        excluded_boxes = c_boxes
 
         for l, k in cls:
             explained_total[k] += 1
@@ -448,6 +645,14 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
         expl_line_boxes = [
             l["box"] for l, k in cls if k in ("title", "label", "note", "pageno", "banner", "blank", "index", "subcap")
         ]
+
+        def _in_excl_band(bb):
+            yc = _yc_box(bb)
+            for eb in excluded_boxes:
+                if eb[1] - Y_SAME_PT <= yc <= eb[3] + Y_SAME_PT:
+                    return True
+            return False
+
         d_remain = []
         for bb in draws:
             ok = False
@@ -458,6 +663,8 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
             elif any(inside_center(bb, sb, 2) for sb in sub_boxes):
                 ok = True
             elif any(inside_center(bb, bd, 0) for bd in banner_bands):
+                ok = True
+            elif _in_excl_band(bb):
                 ok = True
             if not ok:
                 d_remain.append(bb)
@@ -471,7 +678,7 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
             if w <= 5 and h <= 5 and (bb[0] < 8 or bb[1] < 8 or bb[2] > W - 8 or bb[3] > H - 8):
                 continue
             ims.append(bb)
-        explained_boxes = [l["box"] for l, k in cls if k != "remain"] + table_boxes + sub_boxes + banner_bands
+        explained_boxes = [l["box"] for l, k in cls if k not in ("remain", "diagram_label")] + table_boxes + sub_boxes + banner_bands
         i_remain = []
         if ims:
             pix = page.get_pixmap(dpi=72, colorspace=pymupdf.csGRAY)
@@ -503,6 +710,8 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
         for l, k in cls:
             if k == "remain":
                 items.append({"kind": "text", "box": l["box"], "text": l["text"]})
+            elif k == "diagram_label":
+                items.append({"kind": "diagram_label", "box": l["box"], "text": l["text"]})
         for bb in d_remain:
             items.append({"kind": "draw", "box": bb})
         for ib in i_remain:
@@ -520,6 +729,7 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
             "sub_boxes": sub_boxes,
             "banner_bands": banner_bands,
             "items": items,
+            "excluded_boxes": excluded_boxes,
             "n_draw_all": n_draw_all,
             "n_draw_remain": len(d_remain),
             "n_img": len(i_remain),
@@ -571,6 +781,7 @@ def make_regions(R, gap):
             r["cr"] = ci["cr"]
             r["H"] = ci["H"]
             r["split_parts"] = 1
+            r["excluded_boxes"] = ci.get("excluded_boxes") or []
             out.append(r)
     return out
 
@@ -598,6 +809,17 @@ def merge_split_regions(regions):
             rr["split_parts"] = r.get("split_parts", 1)
             merged.append(rr)
         out.extend(merged)
+    return out
+
+
+def cleanup_regions(regions: list[dict]) -> list[dict]:
+    """합친 뒤 C-5 로 뺀 줄을 가르고 D 로 작은·글 조각 영역을 버린다."""
+    out: list[dict] = []
+    for r in regions:
+        for piece in split_region_excluded(r):
+            if region_is_junk(piece["box"], piece["items"]):
+                continue
+            out.append(piece)
     return out
 
 
@@ -634,7 +856,7 @@ def extract_figures(
     doc = pymupdf.open(pdf_path)
     try:
         R = analyze(doc, pages, records, groups, GAP_PT, hwp_records=(hwp_result or {}).get("records") if hwp_result else None)
-        regions = merge_split_regions(make_regions(R, GAP_PT))
+        regions = cleanup_regions(merge_split_regions(make_regions(R, GAP_PT)))
         regions.sort(key=lambda r: (r["page"], _half_order(r["col"]), r["box"][1], r["box"][0]))
 
         hwp_mode = hwp_result is not None
@@ -661,6 +883,8 @@ def extract_figures(
         k_count: dict[str, int] = collections.Counter()
         own_dir = out_dir / "figures" / "own"
         own_dir.mkdir(parents=True, exist_ok=True)
+        for old in own_dir.glob("*.png"):
+            old.unlink()
         rows: list[dict] = []
         pinfo = R["pinfo"]
         for r in regions:

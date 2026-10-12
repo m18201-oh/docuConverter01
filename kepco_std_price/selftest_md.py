@@ -872,7 +872,15 @@ def run_all() -> Check:
     c.check("S4 연속 / 줄바꿈", _pdf_join_cell_lines("가/\n나/\n다") == "가/나/다")
     c.check("S5 혼합", _pdf_join_cell_lines("가/\n나  다\n라") == "가/나 다 라")
 
-    from .figures import fig_filename, fig_id_of, group_code_set, match_groups_by_codes
+    from .figures import (
+        c_exclude_reason,
+        fig_filename,
+        fig_id_of,
+        group_code_set,
+        match_groups_by_codes,
+        record_index,
+        region_is_junk,
+    )
     from .figlink import decide_usage, figure_text_bag, group_data_tuple
 
     c.check("F11 fig_id 규칙", fig_id_of("2025H2#p89#12", 1) == "2025H2#p89#12#f1")
@@ -996,6 +1004,60 @@ def run_all() -> Check:
         c.check("F11 첫 단락에 a.png", "a.png" in block1 and "b.png" not in block1)
         c.check("F11 둘째 단락에 b.png", "b.png" in block2 and "a.png" not in block2)
         c.check("F11 둘째만 출처 줄", "*(출처: 2026H1 대표 그림)*" in block2 and "*(출처:" not in block1)
+
+        figs_orphan = {"unassigned": [{"k": 1, "path": "figures/own/u.png", "source": None}]}
+        render_md(result, md_dir, PDF_NAME, group_figures=figs_orphan)
+        text2 = p.read_text(encoding="utf-8")
+        c.check("F11b E 공종 없는 그림이 md 에 없음", "u.png" not in text2)
+
+    codes, prices, labors = record_index(
+        [{"code": "DE149.10000", "price_raw": "48,630", "labor_raw": "70.83%"}]
+    )
+    c.check(
+        "F11b C-1 공종코드 라벨 도해는 남음",
+        c_exclude_reason("DE149.10000", set(), codes, prices, labors, []) is None,
+    )
+    c.check(
+        "F11b C-1 같은 높이 단가 있으면 표 칸",
+        c_exclude_reason("DE149.10000", {"48,630", "70.83%"}, codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 단가 칸은 빠짐",
+        c_exclude_reason("48,630", set(), codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 같은 줄 코드+단가",
+        c_exclude_reason("DE149.1000048,630", set(), codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 단가·노무비율 붙음",
+        c_exclude_reason("48,63070.83%", set(), codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 짧은 단가 부분문자열은 도해가 아님",
+        c_exclude_reason("370-550m이내,양호", set(), codes, {"550", "48,630"}, labors, []) is None,
+    )
+    note = "④스티프너보강에소요되는단가는철판등재료비가포함되어있으며전기용접에필요한발전기는제외되어있다."
+    c.check(
+        "F11b C-2 주석 문장 빠짐",
+        c_exclude_reason("④스티프너보강에소요되는단가는철판등재료비가포함되어있으며", set(), {}, set(), set(), [note]) == "note",
+    )
+    c.check(
+        "F11b C-2 그림 제목은 안 뺌",
+        c_exclude_reason("[표준도]", set(), {}, set(), set(), [note]) is None,
+    )
+    c.check(
+        "F11b D-1 점 영역 버림",
+        region_is_junk([460.6, 173.1, 461.2, 173.8], [{"kind": "draw", "box": [460.6, 173.1, 461.2, 173.8]}]),
+    )
+    c.check(
+        "F11b D-2 글 조각 버림",
+        region_is_junk([10, 10, 80, 30], [{"kind": "text", "box": [10, 10, 80, 30], "text": "단위"}]),
+    )
+    c.check(
+        "F11b D-2 그림 제목만 있으면 남음",
+        not region_is_junk([10, 10, 80, 30], [{"kind": "text", "box": [10, 10, 80, 30], "text": "[표준도]"}]),
+    )
 
     return c
 

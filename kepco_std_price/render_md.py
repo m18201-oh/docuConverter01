@@ -533,21 +533,6 @@ def _build_md_contents(
 
         contents[relpath] = "\n".join(lines)
 
-    orphan = (group_figures or {}).get("unassigned") or []
-    if orphan and contents:
-        last = sorted(contents.keys())[-1]
-        extra: list[str] = [""]
-        for i, gf in enumerate(orphan):
-            k = gf.get("k", i + 1)
-            rel = gf.get("rel") or _fig_rel(md_dir, gf.get("path") or "")
-            extra.append(f"![그림 {k}]({rel})")
-            src = gf.get("source")
-            if src:
-                extra.append(f"*({src})*")
-            if i != len(orphan) - 1:
-                extra.append("")
-        extra.append("")
-        contents[last] = contents[last].rstrip("\n") + "\n" + "\n".join(extra)
     return contents
 
 

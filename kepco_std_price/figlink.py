@@ -313,7 +313,7 @@ def link_figures(root: str | Path, halves: list[str]) -> None:
                     "basis": "no_twin",
                     "same": None,
                     "review": True,
-                    "review_reason": "2026H1 쪽 공종 연결 실패" if is_rep else "짝 그룹 없음",
+                    "review_reason": "공종 연결 실패",
                     "twin_gid": None,
                     "piece_mismatch": False,
                 }
@@ -463,8 +463,6 @@ def link_figures(root: str | Path, halves: list[str]) -> None:
                             )
                 else:
                     md_figs[gid].append({"k": k, "path": x["file"], "source": None})
-            else:
-                md_figs["unassigned"].append({"k": k, "path": x["file"], "source": None})
 
         for gid, shown in shown_for_group.items():
             md_figs[gid] = shown
