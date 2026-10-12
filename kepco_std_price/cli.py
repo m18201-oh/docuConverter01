@@ -42,10 +42,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="표 본문 낱말이 레코드 필드에 빠짐·중복 없이 들어갔는지 검사",
     )
+    ap.add_argument(
+        "--figures",
+        action="store_true",
+        help="그림 영역을 잘라 figures/own/ 에 PNG 로 저장하고 figures_raw.jsonl 을 쓴다",
+    )
+    ap.add_argument(
+        "--figures-pdf",
+        default=None,
+        help="한글 경로에서 그림 위치를 잡을 때 쓸 PDF (원문에서 저장한 것)",
+    )
     args = ap.parse_args(argv)
 
     if args.hwp and args.pages:
         print("오류: --hwp 와 --pages 는 함께 쓸 수 없습니다.", file=sys.stderr)
+        return 2
+    if args.figures_pdf and not args.figures:
+        print("오류: --figures-pdf 는 --figures 와 함께 씁니다.", file=sys.stderr)
+        return 2
+    if args.hwp and args.figures and not args.figures_pdf:
+        print("오류: 한글 경로의 --figures 는 --figures-pdf 가 필요합니다.", file=sys.stderr)
         return 2
 
     try:
@@ -148,6 +164,21 @@ def main(argv: list[str] | None = None) -> int:
             print("table_shape_warnings_list=" + json.dumps(tw, ensure_ascii=False), flush=True)
         if not tot.get("pass"):
             exit_code = 1
+
+    if args.figures:
+        from .figures import extract_figures
+
+        if args.hwp:
+            pdf_result = extract_pdf(args.figures_pdf, half=args.half)
+            nfig = len(
+                extract_figures(
+                    args.figures_pdf, pdf_result, out, hwp_result=result
+                )
+            )
+        else:
+            nfig = len(extract_figures(args.pdf, result, out))
+        print(f"figures: {nfig}", flush=True)
+
     return exit_code
 
 
