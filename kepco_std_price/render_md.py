@@ -354,8 +354,26 @@ def _pdf_link_target(md_dir: Path, pdf_path: str | Path | None, pdf_name: str) -
             return pdf_name
 
 
+def _fig_rel(md_dir: Path, fig_rel_from_out: str) -> str:
+    """md 파일(md_dir/<field>/…)에서 결과 폴더 기준 그림 경로까지의 상대 경로."""
+    if not fig_rel_from_out:
+        return fig_rel_from_out
+    out_dir = Path(md_dir).resolve().parent
+    fig_abs = (out_dir / fig_rel_from_out).resolve()
+    file_dir = Path(md_dir).resolve() / "_field_"
+    try:
+        rel = os.path.relpath(fig_abs, start=file_dir)
+        return Path(rel).as_posix()
+    except (ValueError, OSError):
+        return fig_rel_from_out
+
+
 def _build_md_contents(
-    result: dict, pdf_name: str, md_dir: Path, pdf_path: str | Path | None = None
+    result: dict,
+    pdf_name: str,
+    md_dir: Path,
+    pdf_path: str | Path | None = None,
+    group_figures: dict[str, list[dict]] | None = None,
 ) -> dict[str, str]:
     """레코드를 대분류별 Markdown 텍스트로 구성해 {md 기준 상대경로(posix): 내용} 을 돌려준다."""
     records: list[dict] = result.get("records") or []
@@ -499,6 +517,18 @@ def _build_md_contents(
                     cap = _esc_text(fig.get("caption"))
                     if cap:
                         lines.append(f"- 그림: {cap}")
+            gfigs = (group_figures or {}).get(gid) or []
+            if gfigs:
+                lines.append("")
+                for i, gf in enumerate(gfigs):
+                    k = gf.get("k", i + 1)
+                    rel = gf.get("rel") or _fig_rel(md_dir, gf.get("path") or "")
+                    lines.append(f"![그림 {k}]({rel})")
+                    src = gf.get("source")
+                    if src:
+                        lines.append(f"*({src})*")
+                    if i != len(gfigs) - 1:
+                        lines.append("")
             lines.append("")
 
         contents[relpath] = "\n".join(lines)
@@ -510,6 +540,7 @@ def render_md(
     md_dir: str | Path,
     pdf_name: str,
     pdf_path: str | Path | None = None,
+    group_figures: dict[str, list[dict]] | None = None,
 ) -> MdSummary:
     md_dir = Path(md_dir)
     summary = MdSummary()
@@ -524,7 +555,7 @@ def render_md(
     # 비교는 이 고정값을 기준으로 하고, 절대 다시 계산하지 않는다(경합 방어 설계 메모 참고).
     md_resolved = md_dir.resolve()
 
-    new_contents = _build_md_contents(result, pdf_name, md_dir, pdf_path)
+    new_contents = _build_md_contents(result, pdf_name, md_dir, pdf_path, group_figures=group_figures)
 
     # 이번 실행의 산출물끼리 대소문자만 다른 경로로 충돌할 수 있다(예: PDF 파싱된
     # field/major 값이 "AB"/"ab" 처럼 대소문자만 다르게 나온 경우). Windows 는 대소문자를
