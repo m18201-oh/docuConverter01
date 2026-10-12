@@ -463,6 +463,8 @@ def link_figures(root: str | Path, halves: list[str]) -> None:
                             )
                 else:
                     md_figs[gid].append({"k": k, "path": x["file"], "source": None})
+            else:
+                md_figs["unassigned"].append({"k": k, "path": x["file"], "source": None})
 
         for gid, shown in shown_for_group.items():
             md_figs[gid] = shown
