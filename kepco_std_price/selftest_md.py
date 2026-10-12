@@ -872,6 +872,193 @@ def run_all() -> Check:
     c.check("S4 연속 / 줄바꿈", _pdf_join_cell_lines("가/\n나/\n다") == "가/나/다")
     c.check("S5 혼합", _pdf_join_cell_lines("가/\n나  다\n라") == "가/나 다 라")
 
+    from .figures import (
+        c_exclude_reason,
+        fig_filename,
+        fig_id_of,
+        group_code_set,
+        match_groups_by_codes,
+        record_index,
+        region_is_junk,
+    )
+    from .figlink import decide_usage, figure_text_bag, group_data_tuple
+
+    c.check("F11 fig_id 규칙", fig_id_of("2025H2#p89#12", 1) == "2025H2#p89#12#f1")
+    c.check("F11 파일 이름 #→_", fig_filename("2025H2#p89#12#f1") == "2025H2_p89_12_f1.png")
+    c.check("F11 unassigned", fig_id_of(None, 2) == "unassigned#f2")
+
+    d = decide_usage(
+        ["4m", "시공기준면"],
+        ["4m", "시공기준면"],
+        group_data_tuple([], []),
+        group_data_tuple([], []),
+        has_twin=True,
+        twin_has_figs=True,
+    )
+    c.check(
+        "F11 도해 글자 같음 → rep",
+        d["used"] == "rep" and d["basis"] == "figure_text" and d["same"] is True and d["review"] is False,
+        str(d),
+    )
+    d = decide_usage(
+        ["4m"],
+        ["5m"],
+        group_data_tuple([], []),
+        group_data_tuple([], []),
+        has_twin=True,
+        twin_has_figs=True,
+    )
+    c.check(
+        "F11 도해 글자 다름 → own+review",
+        d["used"] == "own" and d["review"] is True and d["basis"] == "figure_text" and d["review_reason"] == "그림 글자 다름",
+        str(d),
+    )
+    same_data = group_data_tuple(["① 포함한다."], [("NA201.00000", "토사굴착", "-", "m3")])
+    d = decide_usage([], [], same_data, same_data, has_twin=True, twin_has_figs=True)
+    c.check(
+        "F11 글자 없는 그림 + 공종 데이터 같음 → rep",
+        d["used"] == "rep" and d["basis"] == "group_data" and d["review"] is False,
+        str(d),
+    )
+    d = decide_usage(
+        [],
+        [],
+        group_data_tuple(["① 포함한다."], [("NA201.00000", "토사굴착", "-", "m3")]),
+        group_data_tuple(["① 제외한다."], [("NA201.00000", "토사굴착", "-", "m3")]),
+        has_twin=True,
+        twin_has_figs=True,
+    )
+    c.check(
+        "F11 글자 없는 그림 + 주석 한 줄 다름 → own+review",
+        d["used"] == "own" and d["review"] is True and d["basis"] == "group_data" and d["review_reason"] == "공종 데이터 다름",
+        str(d),
+    )
+    d = decide_usage(["4m"], [], group_data_tuple([], []), None, has_twin=False, twin_has_figs=False)
+    c.check(
+        "F11 짝 없음 → own+review",
+        d["used"] == "own" and d["basis"] == "no_twin" and d["review"] is True,
+        str(d),
+    )
+
+    recs_a = [
+        {"group_id": "ga", "code": "AA001.00001"},
+        {"group_id": "gb", "code": "BB001.00001"},
+    ]
+    recs_b = [
+        {"group_id": "g1", "code": "AA001.00001"},
+        {"group_id": "g2", "code": "BB001.00001"},
+    ]
+    src = [("ga", group_code_set("ga", recs_a)), ("gb", group_code_set("gb", recs_a))]
+    dst = [("g1", group_code_set("g1", recs_b)), ("g2", group_code_set("g2", recs_b))]
+    paired = match_groups_by_codes(src, dst, min_jaccard=0.5)
+    c.check("F11 공종코드 묶음으로 짝", paired == {"ga": "g1", "gb": "g2"}, str(paired))
+    recs_same_title = [
+        {"group_id": "gx", "code": "HA201.00001"},
+        {"group_id": "gy", "code": "JB301.00001"},
+    ]
+    recs_twin = [
+        {"group_id": "t1", "code": "JB301.00001"},
+        {"group_id": "t2", "code": "ZZ999.00001"},
+    ]
+    src2 = [("gx", group_code_set("gx", recs_same_title)), ("gy", group_code_set("gy", recs_same_title))]
+    dst2 = [("t1", group_code_set("t1", recs_twin)), ("t2", group_code_set("t2", recs_twin))]
+    paired2 = match_groups_by_codes(src2, dst2, min_jaccard=0.5)
+    c.check(
+        "F11 제목 같아도 공종코드가 다르면 짝 안 짓는다",
+        paired2.get("gx") is None and paired2.get("gy") == "t1",
+        str(paired2),
+    )
+
+    bag = figure_text_bag(["  4m  ", "① 아래와 같다.", "※ 참고", "시공기준면", "포함한다."])
+    c.check("F11 그림 글자 묶음은 주석형 줄을 뺀다", bag == ["4m", "시공기준면"], str(bag))
+
+    with tempfile.TemporaryDirectory(prefix="g11_mdfig_") as tmp:
+        md_dir = Path(tmp) / "out" / "md"
+        g1 = _group("g1", "토목", "A", "일반", "같은제목", page=10)
+        g2 = _group("g2", "토목", "A", "일반", "같은제목", page=20)
+        result = {
+            "records": [
+                _rec("g1", "A001", "터파기", "1종", "m3", "10,000", "50%", page=10),
+                _rec("g2", "A002", "되메우기", "1종", "m3", "20,000", "40%", page=20),
+            ],
+            "groups": [g1, g2],
+            "half": "2025H2",
+            "sha256": "deadbeef",
+            "pages": [{"pdf_page": 10, "layout": "L1"}, {"pdf_page": 20, "layout": "L1"}],
+        }
+        render_md(result, md_dir, PDF_NAME)
+        p = md_dir / "토목" / "A_일반.md"
+        before = p.read_bytes()
+        render_md(result, md_dir, PDF_NAME)
+        c.check("F11 그림 목록 없으면 md 바이트 같음", p.read_bytes() == before)
+        figs = {
+            "g1": [{"k": 1, "path": "figures/own/a.png", "source": None}],
+            "g2": [{"k": 1, "path": "figures/own/b.png", "source": "출처: 2026H1 대표 그림"}],
+        }
+        render_md(result, md_dir, PDF_NAME, group_figures=figs)
+        text = p.read_text(encoding="utf-8")
+        i1 = text.find("## ■ 같은제목")
+        i2 = text.find("## ■ 같은제목", i1 + 1)
+        c.check("F11 같은 제목 그룹이 두 단락", i1 >= 0 and i2 > i1)
+        block1, block2 = text[i1:i2], text[i2:]
+        c.check("F11 첫 단락에 a.png", "a.png" in block1 and "b.png" not in block1)
+        c.check("F11 둘째 단락에 b.png", "b.png" in block2 and "a.png" not in block2)
+        c.check("F11 둘째만 출처 줄", "*(출처: 2026H1 대표 그림)*" in block2 and "*(출처:" not in block1)
+
+        figs_orphan = {"unassigned": [{"k": 1, "path": "figures/own/u.png", "source": None}]}
+        render_md(result, md_dir, PDF_NAME, group_figures=figs_orphan)
+        text2 = p.read_text(encoding="utf-8")
+        c.check("F11b E 공종 없는 그림이 md 에 없음", "u.png" not in text2)
+
+    codes, prices, labors = record_index(
+        [{"code": "DE149.10000", "price_raw": "48,630", "labor_raw": "70.83%"}]
+    )
+    c.check(
+        "F11b C-1 공종코드 라벨 도해는 남음",
+        c_exclude_reason("DE149.10000", set(), codes, prices, labors, []) is None,
+    )
+    c.check(
+        "F11b C-1 같은 높이 단가 있으면 표 칸",
+        c_exclude_reason("DE149.10000", {"48,630", "70.83%"}, codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 단가 칸은 빠짐",
+        c_exclude_reason("48,630", set(), codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 같은 줄 코드+단가",
+        c_exclude_reason("DE149.1000048,630", set(), codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 단가·노무비율 붙음",
+        c_exclude_reason("48,63070.83%", set(), codes, prices, labors, []) == "table",
+    )
+    c.check(
+        "F11b C-1 짧은 단가 부분문자열은 도해가 아님",
+        c_exclude_reason("370-550m이내,양호", set(), codes, {"550", "48,630"}, labors, []) is None,
+    )
+    note = "④스티프너보강에소요되는단가는철판등재료비가포함되어있으며전기용접에필요한발전기는제외되어있다."
+    c.check(
+        "F11b C-2 주석 문장 빠짐",
+        c_exclude_reason("④스티프너보강에소요되는단가는철판등재료비가포함되어있으며", set(), {}, set(), set(), [note]) == "note",
+    )
+    c.check(
+        "F11b C-2 그림 제목은 안 뺌",
+        c_exclude_reason("[표준도]", set(), {}, set(), set(), [note]) is None,
+    )
+    c.check(
+        "F11b D-1 점 영역 버림",
+        region_is_junk([460.6, 173.1, 461.2, 173.8], [{"kind": "draw", "box": [460.6, 173.1, 461.2, 173.8]}]),
+    )
+    c.check(
+        "F11b D-2 글 조각 버림",
+        region_is_junk([10, 10, 80, 30], [{"kind": "text", "box": [10, 10, 80, 30], "text": "단위"}]),
+    )
+    c.check(
+        "F11b D-2 그림 제목만 있으면 남음",
+        not region_is_junk([10, 10, 80, 30], [{"kind": "text", "box": [10, 10, 80, 30], "text": "[표준도]"}]),
+    )
+
     return c
 
 
