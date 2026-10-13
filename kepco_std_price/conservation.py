@@ -32,6 +32,7 @@ from .spec import (
     UNIT_NORM,
     VLINE_MIN_LEN_PT,
     hangul_span_space_ratio,
+    is_figure_glyph_h,
     landscape_gutter_x,
 )
 
@@ -226,7 +227,10 @@ def _words(page: fitz.Page) -> list[tuple[float, float, float, float, str]]:
         t = w[4]
         if t is None or t == "":
             continue
-        rows.append((float(w[0]), float(w[1]), float(w[2]), float(w[3]), t))
+        y0, y1 = float(w[1]), float(w[3])
+        if is_figure_glyph_h(y0, y1):
+            continue
+        rows.append((float(w[0]), y0, float(w[2]), y1, t))
     if any("" <= ch <= "" for _x0, _y0, _x1, _y1, t in rows for ch in t):
         corrected = _pua_corrected_chars(page)
         if corrected:
@@ -1229,6 +1233,20 @@ def _is_figure_word(
         return True
     if _NOTE_ARROW_RE.fullmatch(t) or t == "시공기준면":
         return True
+    # G12: 도면 상세 번호 (2017H1~2019H2 p54 「상세 "1"」).
+    compact = t.replace(" ", "")
+    if compact.startswith("상세"):
+        return True
+    if t in ("보도", "차도", "변화치수"):
+        return True
+    # 글자층에 공백이 없으면 도식 범례 코드가 한 낱말로 붙는다. 코드 하나는
+    # 주석 문장 속 인용(NC169.22000 등)이므로 그림이 아니다.
+    if re.fullmatch(r"(?:[A-Z]{2}\d{3}\.\d{5}){2,}", compact):
+        return True
+    if re.fullmatch(r"[\"“”']\d+[\"“”']", t):
+        return True
+    if alone_on_line and re.fullmatch(r"\d{1,4}", t):
+        return True
     # G02i2 F5 gate_false_pass 보강(코치 독립 시험 T05, review 표본
     # 2024H1#p98#276 "<XG-21 규격>"): _NOTE_BRACKET_RE 의 두 번째 갈래
     # (앞에 "<" 없이 한글만 있다가 ">"로 끝나는 조각)는 "규격>"처럼
@@ -1310,6 +1328,8 @@ def _note_line_is_structural(text: str) -> bool:
     # 색인 줄 머리 장식(n DH419.11505 …) — 항목 기호 ① 이 아님
     if re.match(r"^n\s*[A-Z]{2}\d", t.strip()):
         return True
+    if compact in ("보도", "차도", "변화치수", "상세") or compact.startswith("상세"):
+        return True
     return False
 
 
@@ -1380,6 +1400,11 @@ def _line_has_diagram_signal(
     texts = [w[4].strip() for w in line if w[4].strip()]
     if not texts:
         return False
+    if all(
+        re.fullmatch(r"\d{1,4}", t) or t in ("보도", "차도", "변화치수", "상세") or t.startswith("상세")
+        for t in texts
+    ):
+        return True
     joined = " ".join(texts)
     joined_compact = joined.replace(" ", "")
     # G02i2 F5 gate_false_pass 보강(코치 독립 시험 T05): "<"·">"가 줄
