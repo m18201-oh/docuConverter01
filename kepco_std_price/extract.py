@@ -525,6 +525,24 @@ def _text_in(spans: list[Span], x0: float, x1: float, y0: float, y1: float) -> s
     return "\n".join(t for t in _cluster_lines(picked) if t.strip() != "")
 
 
+def _trim_overreaching_wide(
+    wide: list[LineSeg], band_h: list[LineSeg], min_len: float = 20.0, tol: float = 1.5
+) -> list[LineSeg]:
+    """표 격자 가로선 후보(wide)에서, 오른쪽 끝이 표 격자의 오른쪽 끝보다 더 바깥인 선(도면 선)을 뺀다.
+    표 격자의 오른쪽 끝 = 같은 띠(band_h)의 가로선 조각(길이 min_len 이상) 둘 이상이 같이 끝나는(tol 안)
+    오른쪽 끝 가운데 가장 오른쪽. 칸마다 끊긴 가로선 조각도 격자 끝을 받쳐 주므로 band_h 에는 폭과
+    상관없이 모두 넣는다. 그런 끝이 없으면 그대로 둔다."""
+    if len(wide) < 2:
+        return wide
+    segs = [h for h in band_h if h.b - h.a >= min_len]
+    edges = [h.b for h in segs if sum(1 for g in segs if abs(g.b - h.b) <= tol) >= 2]
+    if not edges:
+        return wide
+    edge = max(edges)
+    kept = [h for h in wide if h.b <= edge + tol]
+    return kept or wide
+
+
 def _vline_crosses(wx0: float, wx1: float, real_vxs: list[float]) -> bool:
     """실제 세로선이 낱말 x 범위 안쪽을 가로지르는가. 추정 경계는 여기 넣지 않는다."""
     return any(wx0 + 0.35 < vx < wx1 - 0.35 for vx in real_vxs)
@@ -638,10 +656,15 @@ def _collapse(s: str) -> str:
 
 
 def _join_cell_lines(raw: str) -> str:
+    """칸 안 줄들을 잇는다. 줄 경계에서 윗줄이 「/」로 끝나거나(끝 공백은 뗀다) 아랫줄이 「/」로 시작하면
+    (앞 공백은 뗀다) 빈칸 없이, 아니면 빈칸 하나로. 연속 공백은 하나로, 앞뒤는 뗀다. (F3-b)"""
     lines = raw.split("\n")
     out = lines[0] if lines else ""
     for ln in lines[1:]:
-        out += ("" if out.endswith("/") else " ") + ln
+        if out.rstrip().endswith("/") or ln.lstrip().startswith("/"):
+            out = out.rstrip() + ln.lstrip()
+        else:
+            out += " " + ln
     return re.sub(r"\s+", " ", out).strip()
 
 
@@ -2574,6 +2597,12 @@ def extract_pdf(
                     wide_in = [h for h in wide if h.a >= hx0]
                     if wide_in:
                         wide = wide_in
+                    # F3-a: 표 위·옆 도면 가로선이 표 오른쪽 끝을 넘어 뻗어 표 상자 x1 이 쪽 가장자리로
+                    # 늘어난다(2017H1~2019H2 p99 HC329.33000·HC329.55000: 표 선 59.4~537.9, 도면 선 ~597.4).
+                    # 같은 띠의 가로선 조각 둘 이상이 같이 끝나는 가장 오른쪽 끝을 표 격자의 오른쪽 끝으로 보고, 그보다 더 바깥까지 뻗은 선은 뺀다.
+                    wide = _trim_overreaching_wide(
+                        wide, [h for h in hlines if y_top_search <= h.c <= y_max + 40 and h.b > hx0 + 20 and h.a < hx1 - 20]
+                    )
                     if wide:
                         table_x0 = min(h.a for h in wide)
                         table_x1 = max(h.b for h in wide)

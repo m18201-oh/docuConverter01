@@ -934,8 +934,18 @@ def run_all() -> Check:
         _pdf_join_cell_lines("쉬트파일박기/진동식/\n(N≦15)") == "쉬트파일박기/진동식/(N≦15)",
     )
     c.check(
-        "S2 / 뒤 빈칸은 유지",
-        _pdf_join_cell_lines("쉬트파일박기/진동식/ \n(N≦15)") == "쉬트파일박기/진동식/ (N≦15)",
+        "S2 / 뒤 빈칸도 떼고 잇는다 (F3-b)",
+        _pdf_join_cell_lines("쉬트파일박기/진동식/ \n(N≦15)") == "쉬트파일박기/진동식/(N≦15)",
+    )
+    c.check(
+        "S2b 아랫줄이 /로 시작하면 빈칸 없이 (F3-b)",
+        _pdf_join_cell_lines("리핑암\n/굴착깊이") == "리핑암/굴착깊이"
+        and _pdf_join_cell_lines("리핑암 \n /굴착깊이") == "리핑암/굴착깊이",
+    )
+    c.check(
+        "S2c 같은 줄 안 / 옆 빈칸과 일반 줄바꿈은 그대로 (F3-b)",
+        _pdf_join_cell_lines("가 / 나\n다") == "가 / 나 다"
+        and _pdf_join_cell_lines("가\n나 /다") == "가 나 /다",
     )
     c.check("S3 일반 줄바꿈은 빈칸", _pdf_join_cell_lines("콘크리트\n타설") == "콘크리트 타설")
     c.check("S4 연속 / 줄바꿈", _pdf_join_cell_lines("가/\n나/\n다") == "가/나/다")
@@ -1491,6 +1501,106 @@ def run_all() -> Check:
             f2_rep_bad["totals"]["unrecorded_codes"] >= 1 and f2_rep_bad["totals"]["pass"] is False,
             str(f2_rep_bad["totals"]["unrecorded_codes"]),
         )
+
+    # ---------- F3: 표 오른쪽 밖으로 뻗은 도면 선 · 줄바꿈 옆 「/」 잇기 ----------
+    from .extract import LineSeg as _F3Seg
+    from .extract import _trim_overreaching_wide
+
+    grid_f3 = [_F3Seg(59.4, 537.9, y) for y in (289.6, 347.4, 376.3, 376.3, 289.6)]
+    junk_f3 = _F3Seg(210.7, 597.4, 281.6)
+    c.check(
+        "F3 격자 오른쪽 끝을 넘는 도면 선은 표 가로선 후보에서 빠진다",
+        _trim_overreaching_wide(grid_f3 + [junk_f3], grid_f3 + [junk_f3]) == grid_f3,
+    )
+    c.check(
+        "F3 격자뿐이거나 선이 하나뿐이면 그대로 둔다",
+        _trim_overreaching_wide(grid_f3, grid_f3) == grid_f3
+        and _trim_overreaching_wide([junk_f3], [junk_f3]) == [junk_f3],
+    )
+    # 칸마다 끊긴 가로선: 폭 넓은 조각(앞 두 칸)은 399.9 에서 끝나고 맨 위 선만 539.3 까지 이어진다.
+    # 오른쪽 칸 조각(442.4~539.3)이 격자 오른쪽 끝을 받쳐 주므로 맨 위 선을 자르지 않는다.
+    rows_f3 = [_F3Seg(57.9, 399.9, y) for y in (144.2, 173.2, 202.1, 231.0)]
+    top_f3 = _F3Seg(57.9, 539.3, 86.4)
+    right_f3 = [_F3Seg(442.4, 539.3, y) for y in (144.2, 173.2, 202.1, 231.0)]
+    c.check(
+        "F3 칸마다 끊긴 가로선이면 표 전체 폭 선(맨 위)을 자르지 않는다",
+        _trim_overreaching_wide(rows_f3 + [top_f3], rows_f3 + [top_f3] + right_f3) == rows_f3 + [top_f3],
+    )
+    c.check(
+        "F3 같이 끝나는 선이 없으면(표 오른쪽 끝 없음) 그대로 둔다",
+        _trim_overreaching_wide(
+            [_F3Seg(50, 400, 10), _F3Seg(60, 450, 20), _F3Seg(70, 500, 30)],
+            [_F3Seg(50, 400, 10), _F3Seg(60, 450, 20), _F3Seg(70, 500, 30)],
+        )
+        == [_F3Seg(50, 400, 10), _F3Seg(60, 450, 20), _F3Seg(70, 500, 30)],
+    )
+
+    def _f3_make_pdf(path: Path) -> None:
+        doc = _fz2.open()
+        pg = doc.new_page(width=595, height=842)
+
+        def txt(x, y, s_):
+            pg.insert_text((x, y), s_, fontname="korea", fontsize=12.0)
+
+        xs = [40, 200, 310, 380, 420, 470, 540]
+        y_top, y_hdr = 110, 140
+        y_end = y_hdr + 80
+        txt(60, 90, "■ AB50* 시험 그룹 - 공통")
+        # 표 위 도면 가로선: 표 오른쪽 끝(540)을 넘어 쪽 가장자리 가까이(594)까지
+        pg.draw_line((210, y_top - 6), (594, y_top - 6))
+        pg.draw_line((40, y_top), (540, y_top))
+        pg.draw_line((40, y_hdr), (540, y_hdr))
+        for x in xs:
+            pg.draw_line((x, y_top), (x, y_end))
+        for i in range(2):
+            yb = y_hdr + 40 * (i + 1)
+            pg.draw_line((40, yb), (540, yb))
+        for lab, x in (("공종코드", 90), ("공종명칭", 230), ("규격", 332), ("단위", 388), ("단가", 432), ("노무비율", 490)):
+            txt(x, y_top + 20, lab)
+        # 행 1: 윗줄이 「/」로 끝남 · 행 2: 아랫줄이 「/」로 시작
+        for i, (code, l1, l2, spec, price) in enumerate(
+            [
+                ("AB501.10000", "시험명/", "(N≦15)", "규격A", "1,234"),
+                ("AB501.20000", "리핑암", "/굴착깊이", "규격B", "2,345"),
+            ]
+        ):
+            base = y_hdr + 40 * i + 18
+            txt(45, base, code)
+            txt(210, base, l1)
+            txt(210, base + 14, l2)
+            txt(318, base, spec)
+            txt(392, base, "m")
+            txt(424, base, price)
+            txt(490, base, "55%")
+        doc.save(path)
+        doc.close()
+
+    from .conservation import check_conservation as _check_cons_f3
+
+    with tempfile.TemporaryDirectory(prefix="f3_synth_") as tmp:
+        f3_pdf = Path(tmp) / "f3.pdf"
+        _f3_make_pdf(f3_pdf)
+        f3 = extract_pdf(f3_pdf, half="2017H1")
+        f3_cache = f3.pop("_table_cache", None)
+        f3_rep = _check_cons_f3(f3_pdf, f3, table_cache=f3_cache)
+        f3_r = {r["code"]: r for r in f3["records"]}
+        c.check(
+            "F3 표 오른쪽 밖으로 뻗은 도면 선이 있어도 행 상자 x1 은 표 칸 경계(540)",
+            sorted(f3_r) == ["AB501.10000", "AB501.20000"]
+            and all(r["bbox"][2] == 540.0 for r in f3_r.values()),
+            str([r["bbox"] for r in f3_r.values()]),
+        )
+        c.check(
+            "F3 윗줄이 / 로 끝나면 빈칸 없이 잇는다(name_raw 는 줄바꿈 그대로)",
+            f3_r["AB501.10000"]["name"] == "시험명/(N≦15)" and f3_r["AB501.10000"]["name_raw"] == "시험명/\n(N≦15)",
+            str((f3_r["AB501.10000"]["name"], f3_r["AB501.10000"]["name_raw"])),
+        )
+        c.check(
+            "F3 아랫줄이 / 로 시작하면 빈칸 없이 잇는다(name_raw 는 줄바꿈 그대로)",
+            f3_r["AB501.20000"]["name"] == "리핑암/굴착깊이" and f3_r["AB501.20000"]["name_raw"] == "리핑암\n/굴착깊이",
+            str((f3_r["AB501.20000"]["name"], f3_r["AB501.20000"]["name_raw"])),
+        )
+        c.check("F3 합성 PDF 보존 검사 pass", f3_rep["totals"]["pass"] is True, str(f3_rep["totals"]))
 
     return c
 
