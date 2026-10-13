@@ -52,6 +52,15 @@ BANNER_PREFIX = "대분류"
 # L6: 합쳐진 배너 글자 수 제한 없음(대분류 Q, R, S …). major 는 첫 글자.
 BANNER_RE = re.compile(r"대분류\s*([A-Z])(?:\s*[,，]\s*[A-Z])*\s*(.*)$")
 BANNER_TRAIL_RE = re.compile(r"[·.…⋯]+.*$")
+# F1: 띠에 인쇄된 대분류 글자 부분 그대로(공백은 하나로): "A", "Q, R". major 는 그 첫 글자만 둔다.
+BANNER_LETTERS_RE = re.compile(r"대분류\s*([A-Z](?:\s*[,，]\s*[A-Z])*)")
+
+
+def banner_major_raw(src: str) -> str:
+    """배너 줄에서 대분류 글자 부분(``Q, R``)을 인쇄된 그대로(공백만 하나로) 돌려준다. 없으면 빈 문자열."""
+    m = BANNER_LETTERS_RE.search(src or "")
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+
 
 # L10: 1행짜리 작은 표는 헤더/데이터 세로선이 ~19.8pt 로 끊긴다.
 # 단가칸 상자 세로선은 ~8.5pt(가로 2단) / ~12pt(세로). 15 아래로 내리면 잡음.

@@ -16,6 +16,7 @@ from .conservation import snapshot_page_tables
 from .table_seq import TableSeq
 from .spec import (
     BANNER_RE,
+    banner_major_raw,
     BANNER_TRAIL_RE,
     CIRCLED,
     CODE_FIND,
@@ -747,27 +748,27 @@ def _major_name_from(raw: str) -> str:
     return t
 
 
-def _parse_banner_line(line: str) -> tuple[str, str] | None:
-    """합쳐진 배너는 major=첫 글자, 이름은 나머지. 대분류Q, R 기타공사 → (Q, 기타공사)."""
+def _parse_banner_line(line: str) -> tuple[str, str, str] | None:
+    """합쳐진 배너는 major=첫 글자, 이름은 나머지, major_raw=인쇄된 글자 부분. 대분류Q, R 기타공사 → (Q, 기타공사, "Q, R")."""
     if "대분류" not in (line or "").replace(" ", ""):
         return None
     for src in (line, re.sub(r"\s+", "", line)):
         m = BANNER_RE.search(src)
         if m:
-            return m.group(1), _major_name_from(m.group(2) or "")
+            return m.group(1), _major_name_from(m.group(2) or ""), banner_major_raw(src) or m.group(1)
     return None
 
 
-def _banner(spans: list[Span], x0: float, x1: float) -> list[tuple[float, str, str]]:
-    """(yc, letter, name) 대분류 배너. 같은 줄(대분류 D 토공사) 우선, 없으면 아래 줄."""
+def _banner(spans: list[Span], x0: float, x1: float) -> list[tuple[float, str, str, str]]:
+    """(yc, letter, name, major_raw) 대분류 배너. 같은 줄(대분류 D 토공사) 우선, 없으면 아래 줄."""
     seeds = [s for s in spans if x0 - 1 <= s.xc < x1 + 1 and "대분류" in s.text]
-    found: list[tuple[float, str, str]] = []
+    found: list[tuple[float, str, str, str]] = []
     for s in seeds:
         line = _line_text_at(spans, s.yc, x0, x1, tol=12)
         parsed = _parse_banner_line(line) or _parse_banner_line(s.text)
         if parsed is None:
             continue
-        letter, name = parsed
+        letter, name, major_raw = parsed
         if not name:
             below = [
                 t
@@ -780,9 +781,9 @@ def _banner(spans: list[Span], x0: float, x1: float) -> list[tuple[float, str, s
             if "■" in below_txt or CODE_FIND.search(below_txt) or "공종코드" in below_txt:
                 below_txt = ""
             name = _major_name_from(below_txt)
-        found.append((s.yc, letter, name))
+        found.append((s.yc, letter, name, major_raw))
     found.sort(key=lambda it: it[0])
-    uniq: list[tuple[float, str, str]] = []
+    uniq: list[tuple[float, str, str, str]] = []
     for item in found:
         if not uniq or abs(item[0] - uniq[-1][0]) > 20:
             uniq.append(item)
@@ -1853,6 +1854,7 @@ def extract_pdf(
     last_colmap: dict[str, tuple[float, float]] | None = None
     last_major = ""
     last_major_name = ""
+    last_major_raw = ""
     group_seq = 0
     # H1: 표가 쪽·단을 넘어 이어질 때도 직전 소제목(＊)·직전 명칭을 이어받는다.
     # last_group·last_colmap 과 같은 원리로, 새 ■ 그룹이 시작될 때만 끊는다(new_group 참고).
@@ -1872,9 +1874,10 @@ def extract_pdf(
             spans_pre = _page_spans(page)
             for _ph, hx0, hx1 in halves_pre:
                 spans = [s for s in spans_pre if _in_half(s, hx0, hx1)]
-                for _yc, letter, name in _banner(spans, hx0, hx1):
+                for _yc, letter, name, major_raw in _banner(spans, hx0, hx1):
                     last_major = letter
                     last_major_name = name
+                    last_major_raw = major_raw
 
     for pno in range(start, end + 1):
         page = doc[pno - 1]
@@ -1990,8 +1993,8 @@ def extract_pdf(
             # y-ordered events: 배너 + group headers + clusters + 단가정의 라벨
             dangas = [s for s in spans if _is_danga_label(s.text)]
             events: list[tuple[float, str, object]] = []
-            for yc, letter, name in banners:
-                events.append((yc, "banner", (letter, name)))
+            for yc, letter, name, major_raw in banners:
+                events.append((yc, "banner", (letter, name, major_raw)))
             for g in gheads:
                 events.append((g.yc, "group", g))
             for cl in clusters:
@@ -2004,7 +2007,7 @@ def extract_pdf(
             half_started = False
 
             def new_group(header_span: Span) -> dict:
-                nonlocal group_seq, last_group, last_major, last_sub, last_prev_name, current_title, in_note_zone
+                nonlocal group_seq, last_group, last_major, last_major_raw, last_sub, last_prev_name, current_title, in_note_zone
                 group_seq += 1
                 # 새 ■ 그룹은 새 주제이므로 직전 그룹의 소제목·명칭 이어받기를 끊는다.
                 last_sub = None
@@ -2028,6 +2031,7 @@ def extract_pdf(
                     "header_raw": raw,
                     "header": header,
                     "major": last_major,
+                    "major_raw": last_major_raw,
                     "major_name": last_major_name,
                     "field": page_field,
                     "notes": [],
@@ -2336,9 +2340,10 @@ def extract_pdf(
                 else:
                     next_y = page.rect.height - 12
                 if etype == "banner":
-                    letter, name = payload  # type: ignore[misc]
+                    letter, name, major_raw = payload  # type: ignore[misc]
                     last_major = letter
                     last_major_name = name
+                    last_major_raw = major_raw
                 elif etype == "group":
                     current_group = new_group(payload)  # type: ignore[arg-type]
                     half_started = True
@@ -2635,6 +2640,8 @@ def extract_pdf(
                         if grp is not None:
                             if not grp.get("major"):
                                 grp["major"] = code[0]
+                            if not grp.get("major_raw"):
+                                grp["major_raw"] = grp["major"]
                             grp["record_count"] = grp.get("record_count", 0) + 1
                         records.append(rec)
                         in_note_zone = False

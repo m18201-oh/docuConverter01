@@ -471,6 +471,17 @@ def run_all() -> Check:
         g_lat.get("major") == "Q" and g_lat.get("major_name") == "기타공사",
         str(g_lat),
     )
+    c.check(
+        "F1 한글 합친 띠 major_raw 'Q, R, S' · major 'Q'",
+        g_lat.get("major_raw") == "Q, R, S" and g_lat.get("major") == "Q",
+        str(g_lat),
+    )
+    g_one = groups[0] if groups else {}
+    c.check(
+        "F1 한글 단일 띠 major_raw 'A' · major 'A'",
+        g_one.get("major_raw") == "A" and g_one.get("major") == "A",
+        str(g_one),
+    )
     notes_lat = [n.get("item") or "" for n in (g_lat.get("notes") or [])]
     c.check(
         "H1 notes end at 수량산출 예",
@@ -856,6 +867,102 @@ def run_all() -> Check:
         + rec(hr.HWPTAG_PARA_CHAR_SHAPE, 1, struct.pack("<II", 0, 0))
     )
     c.check("K6 컨트롤 수가 안 맞으면 오류", read_err([0], broken))
+
+    # ---- F1-b: 표 칸 안 문단 줄바꿈(LINE_BREAK) ----
+    def _cell_lb(col: int, row: int, *lines: str) -> str:
+        """한 문단 안에 강제 줄바꿈(LineBreak)으로 줄을 나눈 칸. 줄이 하나면 줄바꿈 없는 칸."""
+        inner = "<LineBreak/>".join(f"<Text>{ln}</Text>" for ln in lines)
+        return (
+            f'<TableCell col="{col}" row="{row}" colspan="1" rowspan="1" width="1000" height="400">'
+            f"<Paragraph><LineSeg>{inner}</LineSeg></Paragraph></TableCell>"
+        )
+
+    def _row_lb(cells: list[str]) -> str:
+        return "<TableRow>" + "".join(cells) + "</TableRow>"
+
+    lb_rows = [
+        _ts_header(),
+        _row_lb([
+            _cell(0, 1, "AC340.21000"),
+            _cell_lb(1, 1, "견인식"),
+            _cell_lb(2, 1, "견인식", "3ton, 5ton"),
+            _cell(3, 1, "대"),
+            _cell(4, 1, "1,000"),
+            _cell(5, 1, "10.00%"),
+        ]),
+        _row_lb([
+            _cell(0, 2, "AC340.21001"),
+            _cell_lb(1, 2, "콘테이너(2.4m×3m)/", "3개월이하"),
+            _cell_lb(2, 2, "-", " "),
+            _cell(3, 2, "월"),
+            _cell(4, 2, "2,000"),
+            _cell(5, 2, "10.00%"),
+        ]),
+        _row_lb([
+            _cell(0, 3, "AC340.21002"),
+            _cell_lb(1, 3, "가나", "다라", "마바"),
+            _cell_lb(2, 3, "A", " ", "B"),
+            _cell(3, 3, "식"),
+            _cell(4, 3, "3,000"),
+            _cell(5, 3, "10.00%"),
+        ]),
+    ]
+    res_lb = extract_from_root(
+        etree.fromstring(make_xml_table_seq(f"{_text_para('■ AC34* 시험')}{_table(lb_rows)}")), "2026H1", sha="lb"
+    )
+    r_lb = {r["code"]: r for r in res_lb["records"]}
+    a = r_lb.get("AC340.21000", {})
+    c.check(
+        "F1 칸 안 줄바꿈 spec_raw 는 줄바꿈 문자, spec 은 공백 하나",
+        a.get("spec_raw") == "견인식\n3ton, 5ton" and a.get("spec") == "견인식 3ton, 5ton",
+        repr((a.get("spec_raw"), a.get("spec"))),
+    )
+    c.check(
+        "F1 줄바꿈 없는 칸 name_raw 불변",
+        a.get("name_raw") == "견인식" and a.get("name") == "견인식",
+        repr((a.get("name_raw"), a.get("name"))),
+    )
+    b2 = r_lb.get("AC340.21001", {})
+    c.check(
+        "F1 '/' 뒤 줄바꿈은 PDF 경로와 같이 붙인다",
+        b2.get("name_raw") == "콘테이너(2.4m×3m)/\n3개월이하" and b2.get("name") == "콘테이너(2.4m×3m)/3개월이하",
+        repr((b2.get("name_raw"), b2.get("name"))),
+    )
+    c.check(
+        "F1 줄바꿈 뒤가 빈칸뿐이면 줄바꿈 문자를 만들지 않는다",
+        b2.get("spec_raw") == "- " and b2.get("spec") == "-",
+        repr((b2.get("spec_raw"), b2.get("spec"))),
+    )
+    d2 = r_lb.get("AC340.21002", {})
+    c.check(
+        "F1 줄바꿈 두 번 → 줄바꿈 문자 두 개 · 정리 칸 공백 하나씩",
+        d2.get("name_raw") == "가나\n다라\n마바" and d2.get("name") == "가나 다라 마바",
+        repr((d2.get("name_raw"), d2.get("name"))),
+    )
+    c.check(
+        "F1 중간 빈칸뿐인 조각은 줄 하나로 본다",
+        d2.get("spec_raw") == "A \nB" and d2.get("spec") == "A B",
+        repr((d2.get("spec_raw"), d2.get("spec"))),
+    )
+
+    # 한글 원본 바이트: 칸 안 글자 코드 10 -> LineBreak, 표 밖 문단은 그대로(글에 안 넣음)
+    top_lb = para(0, "가" + chr(10) + "나", [(0, 0)])
+    tbl_lb = table_para([("견인식" + chr(10) + "3ton", [(0, 0)])])
+    root_lb = hr.root_from_streams([0], [top_lb + tbl_lb])
+    col0 = root_lb.find("BodyText/SectionDef/ColumnSet")
+    c.check(
+        "F1 표 밖 문단 줄바꿈은 LineBreak 를 만들지 않는다",
+        "LineBreak" not in [t.tag for t in col0[0]],
+        repr([t.tag for t in col0[0]]),
+    )
+    cell_p = root_lb.find(".//TableCell/Paragraph")
+    c.check(
+        "F1 표 칸 안 글자 코드 10 -> Text, LineBreak, Text",
+        [t.tag for t in cell_p] == ["Text", "LineBreak", "Text"] and [t.text for t in cell_p.iter("Text")] == ["견인식", "3ton"],
+        repr([(t.tag, t.text) for t in cell_p]),
+    )
+    gate_lb = _gate._rd_root_from_streams([0], [top_lb + tbl_lb])
+    c.check("F1 검사기 쪽 읽기 사본도 같은 나무(LineBreak 포함)", etree.tostring(gate_lb) == etree.tostring(root_lb))
 
     return c
 
