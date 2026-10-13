@@ -19,6 +19,7 @@ from .spec import (
     BANNER_TRAIL_RE,
     CIRCLED,
     CODE_FIND,
+    CODE_FULL,
     CODE_RE,
     FIELD_RE_PDF as FIELD_RE,
     FIGURE_CAPTION_PREFIXES,
@@ -38,6 +39,7 @@ from .spec import (
     UNIT_NORM,
     VLINE_MIN_LEN_PT,
     hangul_span_space_ratio,
+    is_figure_glyph_h,
     landscape_gutter_x,
 )
 
@@ -221,7 +223,10 @@ def _page_spans(page: fitz.Page) -> list[Span]:
                 if not t.strip() and t != " ":
                     continue
                 x0, y0, x1, y1 = s["bbox"]
-                out.append(Span(float(x0), float(y0), float(x1), float(y1), t, float(s.get("size") or 0.0)))
+                fy0, fy1 = float(y0), float(y1)
+                if is_figure_glyph_h(fy0, fy1):
+                    continue
+                out.append(Span(float(x0), fy0, float(x1), fy1, t, float(s.get("size") or 0.0)))
     _fix_pua_spans(out)
     return out
 
@@ -240,7 +245,10 @@ def _page_chars(page: fitz.Page) -> list[Span]:
                     if ch == "":
                         continue
                     x0, y0, x1, y1 = c["bbox"]
-                    out.append(Span(float(x0), float(y0), float(x1), float(y1), ch, sz))
+                    fy0, fy1 = float(y0), float(y1)
+                    if is_figure_glyph_h(fy0, fy1):
+                        continue
+                    out.append(Span(float(x0), fy0, float(x1), fy1, ch, sz))
     _fix_pua_spans(out)
     return out
 
@@ -1090,6 +1098,31 @@ def _is_figure_caption_line(text: str) -> bool:
     return text.lstrip().startswith(FIGURE_CAPTION_PREFIXES)
 
 
+def _is_diagram_note_table(s: str) -> bool:
+    """주석 (표) 로 넣으면 안 되는 도식·축소 삽입 상자인가. 구분 있는 실표는 False."""
+    compact = re.sub(r"\s+", "", s or "")
+    if "구분" in compact:
+        return False
+    if "양호" in compact and CODE_FIND.search(compact):
+        return True
+    if re.search(r"[A-Z]{2}\d+\*+", s or ""):
+        return True
+    if "ack)" in (s or "") or "변화치수" in compact:
+        return True
+    if "보도" in compact or "차도" in compact:
+        return True
+    if "우수맨홀" in compact or "오수맨홀" in compact or "집수정(" in compact:
+        return True
+    if "엄지말뚝" in compact or "정의】" in (s or "") or re.search(r"(?<![A-Za-z])\d+\*+", s or ""):
+        return True
+    if "터파기" in compact and "구분" not in compact:
+        return True
+    body = re.sub(r"[\s|/(표)]+", "", s or "")
+    if 0 < len(body) <= 4:
+        return True
+    return False
+
+
 def _figure_captions_from_words(
     words: list[tuple[float, float, float, float, str]],
     x0: float,
@@ -1179,7 +1212,14 @@ def _note_items(
         item_raw = _trim_note("\n".join(parts))
         if joined_space and not _is_note_junk(joined_space):
             item = _trim_note(_join_note_lines(parts, parts_eol))
-            items.append(
+            item = re.sub(
+                r"(한다\.)\s*상\s*세\s*[\"“”']?\d+[\"“”']?\s*$", r"\1", item
+            )
+            item_raw = re.sub(
+                r"(한다\.)\s*상\s*세\s*[\"“”']?\d+[\"“”']?\s*$", r"\1", item_raw
+            )
+            if item:
+                items.append(
                 {
                     "item": item,
                     "item_raw": item_raw,
@@ -1193,11 +1233,25 @@ def _note_items(
 
     for i, line in enumerate(lines):
         s = line.strip()
-        if not s or s.startswith("【단가정의】") or s.startswith("단가정의"):
+        # G12: 같은 y 에 붙은 도식 범례(코드 나열·변화치수·H형강) 를 줄 끝에서 뗀다.
+        s = re.sub(r"(?:[A-Z]{2}\d{3}\.\d{5}){2,}$", "", s)
+        s = re.sub(r"(?:변화치수)+$", "", s)
+        s = re.sub(r"(?<=\S)\(H-\d[^)]*\)\S*$", "", s)
+        s = re.sub(r"ack\)\S*$", "", s)
+        s = re.sub(r"(?:\s+\d{2,3})+\s*(?:1h)?$", "", s, flags=re.I)
+        s = re.sub(r"집수정\s*\(\d[^)]*\).*$", "", s)
+        s = re.sub(r"(?:-일축압축강도(?!에).*)+$", "", s)
+        s = re.sub(r"(한다\.)\s*상\s*세\s*[\"“”']?\d+[\"“”']?\s*$", r"\1", s)
+        s = s.strip()
+        # G12: 「·【단가정의】」(2016H1 p223·p227 커튼박스) 도 라벨이다.
+        s_lead = s.lstrip("·ㆍ‧･․.•∙●○ \t")
+        if not s or s_lead.startswith("【단가정의】") or s_lead.startswith("단가정의"):
             continue
         if _is_figure_caption_line(s):
             continue
         if s.startswith("(표)"):
+            if _is_diagram_note_table(s):
+                continue
             flush()
             items.append({"item": s, "item_raw": s, "pdf_page": pdf_page, "subtable": True})
             continue
@@ -1365,6 +1419,34 @@ def _is_structural_note_junk(s: str) -> bool:
     # 옮긴다 — 두 파일이 서로 다른 기준으로 갈라져 있었다.
     if re.fullmatch(r"-\s*(초기굴진|본굴진|도달굴진)", t):
         return True
+    if t == "시공기준면" or compact == "시공기준면":
+        return True
+    if (
+        re.search(r"(양호|보통|불량)", compact)
+        and CODE_FIND.search(compact)
+        and "반영" not in compact
+        and "적용" not in compact
+        and "단가" not in compact
+    ):
+        return True
+    if t.startswith("[표준도"):
+        return True
+    if t == "상세":
+        return True
+    if compact in ("보도", "차도", "변화치수"):
+        return True
+    toks = [p for p in t.split() if p]
+    if toks and all(CODE_FULL.fullmatch(p) for p in toks):
+        return True
+    if re.fullmatch(r"(?:[A-Z]{2}\d{3}\.\d{5})+", compact):
+        return True
+    # G12: 공백 없는 옛 판 도면 「상세"1"」. 띄어 쓴 「상  세 "1"」(2026 PDF)는 그림 글자로 남긴다.
+    if " " not in t.strip() and re.fullmatch(r"상세[\"“”']?\d+[\"“”']?", compact):
+        return True
+    if re.fullmatch(r"[\"“”']\d+[\"“”']", t):
+        return True
+    if re.fullmatch(r"\d{1,4}", compact):
+        return True
     return False
 
 
@@ -1377,6 +1459,10 @@ def _is_note_junk(s: str) -> bool:
     t = s.strip()
     if _is_structural_note_junk(t):
         return True
+    # G12: 쪽 넘김으로 잘린 문장 끝(2017H1·2018H1 p81→p82 「한다.」)은
+    # 새 항목 잡음이 아니다. _merge_note_continuations 가 앞 항목에 잇는다.
+    if re.fullmatch(r"[가-힣]{1,4}다\.?", t):
+        return False
     if t[0] in CIRCLED or t.startswith("(표)") or t.startswith("<"):
         return False
     compact = t.replace(" ", "")
@@ -1385,6 +1471,17 @@ def _is_note_junk(s: str) -> bool:
     if not compact:
         return True
     if len(compact) < 24 and not re.search(r"[가-힣]{3,}", t):
+        return True
+    # G12: 표 칸 명칭 첫 줄(「수직구 굴착/5m초과,」)이 주석 항목으로 시작하지 않게.
+    if (
+        "/" in t
+        and "단가" not in t
+        and "포함" not in t
+        and "적용" not in t
+        and "제외" not in t
+        and len(compact) <= 40
+        and not (t[0] in CIRCLED or t.startswith("※"))
+    ):
         return True
     return False
 
@@ -1433,6 +1530,11 @@ def _is_diagram_table(
         or re.search(r"\d+(?:\.\d+)?\s*[~∼\-]\s*\d+(?:\.\d+)?m(?!\S)", full_txt)
     )
     if CODE_FIND.search(full_txt) and has_dist_range and not has_price_comma:
+        return True
+    compact = re.sub(r"\s+", "", full_txt)
+    if "변화치수" in compact or "[표준도" in compact:
+        return True
+    if re.fullmatch(r"(?:[A-Z]{2}\d{3}\.\d{5})+", compact):
         return True
     return False
 
@@ -1796,7 +1898,7 @@ def extract_pdf(
         words_all = [
             (float(w[0]), float(w[1]), float(w[2]), float(w[3]), w[4])
             for w in page.get_text("words")
-            if w[4]
+            if w[4] and not is_figure_glyph_h(float(w[1]), float(w[3]))
         ]
         hlines, vlines = _page_lines(page)
         try:
@@ -1979,6 +2081,18 @@ def extract_pdf(
                         # 주석 표에 넣지 않는다.
                         figure_boxes.append(tb)
                         continue
+                    # G12: 원문자 주석이 칸에 있으면 find_tables 오인 — 글줄로 남긴다.
+                    if any(ch in full_txt for ch in CIRCLED):
+                        continue
+                    if (
+                        "변화치수" in full_c
+                        or "[표준도" in full_c
+                        or full_c in ("보도", "차도", "보도차도")
+                        or re.fullmatch(r"(?:[A-Z]{2}\d{3}\.\d{5})+", full_c)
+                        or re.fullmatch(r"[\d.|/\s]+", full_txt.replace(" ", ""))
+                    ):
+                        figure_boxes.append(tb)
+                        continue
                     ncodes = 0
                     for s in rec_codes:
                         if tb[0] - 5 <= s.xc <= tb[2] + 5 and tb[1] <= s.yc <= tb[3]:
@@ -2051,6 +2165,17 @@ def extract_pdf(
                 for gy, gflat, gbox in _geom_note_subtables(
                     hx0, hx1, y0, y1, hlines, vlines, words_all, claimed_boxes
                 ):
+                    g_c = re.sub(r"\s+", "", gflat)
+                    if any(ch in gflat for ch in CIRCLED):
+                        continue
+                    if (
+                        "변화치수" in g_c
+                        or "[표준도" in g_c
+                        or re.fullmatch(r"(?:[A-Z]{2}\d{3}\.\d{5})+", g_c)
+                        or re.fullmatch(r"[\d.|/]+", g_c)
+                    ):
+                        figure_boxes.append(gbox)
+                        continue
                     table_entries.append((gy, gflat))
                     figure_boxes.append(gbox)
                 have_sub = bool(table_entries)
@@ -2078,6 +2203,12 @@ def extract_pdf(
                 line_eols = _eol_spaces_for_lines(
                     chars, [yc for yc, _ in raw_lines_y], hx0, hx1
                 )
+                gid = grp.get("group_id")
+                sub_compact = "".join(
+                    re.sub(r"\s+", "", f"{sub.get('code_pattern') or ''}{sub.get('text') or ''}")
+                    for sub in subheaders
+                    if sub.get("group_id") == gid
+                )
                 # text lines
                 text_entries: list[tuple[float, str, bool | None]] = []
                 for (ly, ln), eol in zip(raw_lines_y, line_eols):
@@ -2103,6 +2234,11 @@ def extract_pdf(
                     # 한다 — 여기서 먼저 걸러내면 줄바꿈 끝 조각이 통째로
                     # 사라진다(N1 결함의 원인이었다).
                     if _is_structural_note_junk(s):
+                        continue
+                    # G12: 소제목 줄이 주석 밴드(표~단가정의)에 새어 ① 앞에 붙지 않게
+                    # (2016H1 p76 「직접잔토처리/발파암」, 2016H1·2021H1 p135 「수직구 굴착/…」).
+                    sc = re.sub(r"\s+", "", s)
+                    if sub_compact and sc and sc in sub_compact:
                         continue
                     # (표) 글줄 중복: 이미 flatten 한 표에 들어 있는 글만 건너뜀
                     # ("|"·"/" 칸·행 구분자 때문에 이어져 있던 낱말이 끊겨 보여
@@ -2256,7 +2392,10 @@ def extract_pdf(
                         if found is not None:
                             current_title = found
 
-                    vxs = _vxs_near(vlines, y_min - 50, y_max + 20, table_x0, table_x1)
+                    # G12: y_min-50 는 머리글 칸 안쪽 짧은 세로선(2017H1~2019H2
+                    # p97 「오수맨홀」을 가르는 vx=184.5 등)까지 데이터 열 경계로
+                    # 넣는다. 데이터 행과 겹치는 선만 쓴다(여유 10pt).
+                    vxs = _vxs_near(vlines, y_min - 10, y_max + 10, table_x0, table_x1)
                     real_vxs = list(vxs)
                     colmap, shape_ws = _build_columns(vxs, table_x0, table_x1, lab)
                     if lab and "price" in lab:
@@ -2591,6 +2730,11 @@ def extract_pdf(
                     n["item"] = _restore_spaces(
                         n.get("item") or "", page_chars.get(int(n.get("pdf_page") or 0), [])
                     )
+                n["item"] = re.sub(
+                    r"(한다\.)\s*(?:\(H-\d[^)]*\)|상\s*세\s*[\"“”']?\d+[\"“”']?|\s)+$",
+                    r"\1",
+                    n.get("item") or "",
+                )
                 n["_eol"] = None
     for g in groups:
         if g.get("notes"):

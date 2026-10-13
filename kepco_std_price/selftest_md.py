@@ -695,6 +695,75 @@ def run_all() -> Check:
         restored_note,
     )
 
+    # ---------- G12: 옛 판 주석·칸 경계 ----------
+    from .extract import (
+        LineSeg,
+        _is_diagram_note_table,
+        _is_note_junk,
+        _is_structural_note_junk,
+        _note_items,
+        _vxs_near,
+        _vline_crosses,
+    )
+    from .spec import is_figure_glyph_h
+    from .conservation import _is_figure_word
+
+    c.check("G12 tiny CAD glyph 2.5pt", is_figure_glyph_h(207.6, 210.1) is True)
+    c.check("G12 body glyph 14pt not tiny", is_figure_glyph_h(517.6, 532.0) is False)
+    c.check("G12 4.2pt CAD glyph", is_figure_glyph_h(227.3, 231.5) is True)
+    c.check("G12 superscript 5.76pt not tiny", is_figure_glyph_h(0.0, 5.76) is False)
+
+    c.check("G12 시공기준면 is figure junk", _is_structural_note_junk("시공기준면") is True)
+    c.check('G12 상세"1" is figure junk', _is_structural_note_junk('상세"1"') is True)
+    c.check('G12 quoted "1" is figure junk', _is_structural_note_junk('"1"') is True)
+    c.check("G12 dim 600 is figure junk", _is_structural_note_junk("600") is True)
+    c.check("G12 상세 alone is figure junk", _is_structural_note_junk("상세") is True)
+    c.check("G12 차도 is figure junk", _is_structural_note_junk("차도") is True)
+    c.check("G12 name-wrap / line is new-item junk", _is_note_junk("수직구 굴착/5m초과,") is True)
+    c.check("G12 한다. is not new-item junk", _is_note_junk("한다.") is False)
+
+    items_dot = _note_items(["·【단가정의】", "① 이 단가는 커튼박스 설치에 소요되는 제비용을 포함한다."], 223)
+    c.check(
+        "G12 ·【단가정의】 label is not a note item",
+        len(items_dot) == 1 and items_dot[0]["item"].startswith("①"),
+        str(items_dot),
+    )
+    items_tail = _note_items(["① 제경비를 포함", "한다."], 82)
+    c.check(
+        "G12 한다. joins previous note",
+        len(items_tail) == 1 and items_tail[0]["item"].endswith("한다."),
+        str(items_tail),
+    )
+
+    header_v = [LineSeg(636.8, 661.0, 184.5)]
+    data_v = [LineSeg(659.8, 716.7, 210.5)]
+    xs_data = _vxs_near(data_v + header_v, 665.0, 710.0, 30.0, 540.0)
+    c.check(
+        "G12 header-only vline excluded from data rows",
+        184.5 not in xs_data and any(abs(x - 210.5) < 0.2 for x in xs_data),
+        str(xs_data),
+    )
+    c.check(
+        "G12 오수맨홀 not crossed by name|spec vline 210.5",
+        _vline_crosses(150.9, 198.9, [210.5]) is False,
+    )
+    c.check(
+        "G12 diagram (표) 양호+code skipped",
+        _is_diagram_note_table("(표) 양호 | 보통 | 불량 / ND109.11111 0-150m이내, 양호") is True,
+    )
+    c.check(
+        "G12 real 구분 (표) kept",
+        _is_diagram_note_table("(표) 구분 | 전용횟수 | 적용기준 / 매끈한마감 | 2～3회") is False,
+    )
+    c.check(
+        'G12 gate "1" is figure word',
+        _is_figure_word(317.0, 280.0, 325.0, 288.0, '"1"', [], True) is True,
+    )
+    c.check(
+        "G12 gate 600 alone is figure word",
+        _is_figure_word(130.0, 460.0, 145.0, 475.0, "600", [], True) is True,
+    )
+
     # K3③: conservation.py 와 extract.py 의 PUA 숫자 대응표 키 집합이 같아야 한다.
     from .conservation import _PUA_DIGIT_MAP as _GATE_PUA
     from .extract import _PUA_DIGIT_MAP as _EXTRACT_PUA

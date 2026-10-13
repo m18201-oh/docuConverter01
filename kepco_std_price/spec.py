@@ -62,7 +62,7 @@ VLINE_MIN_LEN_PT = 15.0
 # 24자를 넘으면 표 잔여/다음 줄이 붙은 것으로 보고 버린다. (G02f 실측)
 MAJOR_NAME_MAX_LEN = 24
 
-FIGURE_CAPTION_PREFIXES = ("[그림", "[표준도]")
+FIGURE_CAPTION_PREFIXES = ("[그림", "[표준도")
 
 # PDF 분야 표지(사이에 반기 문구가 끼지 않은 이어붙임)
 FIELD_RE_PDF = re.compile(r"([가-힣]+(?:및[가-힣]+)*)분야자체표준시장단가")
@@ -107,6 +107,15 @@ LANDSCAPE_WORD_GAP_MIN_PT = 18.0
 # 2023H2 본문은 Type3 라 공백 글리프가 없고, 5권 본문(휴먼명조)은 있다.
 # 표 안 MalgunGothic 은 판이 같아 비율을 뒤집지 않는다. 0.07 은 두 군집 사이.
 TEXT_LAYER_SPACE_RATIO_MIN = 0.07
+
+# 도식·CAD 삽입 축소 개체의 글자 높이. 본문 한글 ~14pt, 윗첨자 ~5.8pt,
+# 2016H1 가시설 도면 안 축소 【단가정의】·표준도 범례 ~1.4–2.5pt (G12 실측).
+FIGURE_GLYPH_MAX_H_PT = 5.0
+
+
+def is_figure_glyph_h(y0: float, y1: float) -> bool:
+    """bbox 높이가 축소 도식 글자면 True. 본문·윗첨자는 False."""
+    return (y1 - y0) < FIGURE_GLYPH_MAX_H_PT
 
 
 def hangul_span_space_ratio(texts: list[str]) -> float:
