@@ -275,6 +275,24 @@ def rnd_box(b):
     return [round(float(v), 1) for v in b]
 
 
+# F2: 표 행 상자의 x0 가 쪽 가장자리(2.0)로 눌려 있던 판(2017H1~2019H2 p97)은 표 상자가 단 왼쪽
+# 끝까지 덮어, 표 옆 여백으로 삐져나온 도면 선 조각(치수 눈금)이 묻혀 있었다. 행 상자를 표 칸
+# 경계로 바로잡으면 그 조각이 새 「그림」 영역으로 보이므로, 표와 같은 높이 띠의 단 가장자리까지
+# 사이(표 왼쪽·오른쪽 여백)에 있는 작은 도면 조각은 그림이 아니라 여백 조각으로 본다.
+TABLE_MARGIN_DEBRIS_MAX_PT = 40.0
+
+
+def table_margin_debris(bb, table_boxes, cr) -> bool:
+    w, h = bb[2] - bb[0], bb[3] - bb[1]
+    if w > TABLE_MARGIN_DEBRIS_MAX_PT or h > TABLE_MARGIN_DEBRIS_MAX_PT:
+        return False
+    cx, cy = center(bb)
+    for tb in table_boxes:
+        if tb[1] <= cy <= tb[3] and (cr[0] <= cx < tb[0] or tb[2] < cx <= cr[2]):
+            return True
+    return False
+
+
 def col_rect(page_w, page_h, layout, half):
     if layout == "landscape_2up" and half in ("L", "R"):
         return [0, 0, page_w / 2, page_h] if half == "L" else [page_w / 2, 0, page_w, page_h]
@@ -426,6 +444,7 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
             else:
                 top = bx[1] - 4
             table_boxes.append([bx[0] - 4, top, bx[2] + 4, bx[3] + 4])
+        rec_table_boxes = list(table_boxes)  # 레코드 행 상자에서 만든 표 상자(F2: 여백 조각 판정용)
 
         title_lines = [l for l in lines if l["c"].startswith("■")]
         col_groups = grp_by_col.get((pno, half), [])
@@ -665,6 +684,8 @@ def analyze(doc, pages: list[dict], records: list[dict], groups: list[dict], gap
             elif any(inside_center(bb, bd, 0) for bd in banner_bands):
                 ok = True
             elif _in_excl_band(bb):
+                ok = True
+            elif table_margin_debris(bb, rec_table_boxes, cr):
                 ok = True
             if not ok:
                 d_remain.append(bb)

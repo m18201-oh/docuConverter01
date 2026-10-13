@@ -198,3 +198,145 @@ def landscape_gutter_x(
         if dens > 3:
             return mid
     return found
+
+
+# --- F2: 옛 판 보강 (2016H1~2019H2) ---
+
+# 칸 안에서 줄이 꺾여 두 줄로 찍힌 공종코드(2016H1 p112 「ND109.1112」+ 아래 줄 「1」).
+CODE_WRAP_HEAD_RE = re.compile(r"^[A-Z]{2}\d{3}\.\d{4}$")
+
+
+def code_tail_below(
+    head: tuple[float, float, float, float],
+    tail: tuple[float, float, float, float],
+) -> bool:
+    """head(코드 앞 열 자리) 바로 아래 줄에 있는 낱글자 tail 이 같은 칸의 코드 꼬리인가.
+
+    순수 기하: tail 가운데 x 가 head 가로 안, tail 윗끝이 head 아랫끝에서 -4~8pt 안,
+    글자 높이가 head 와 비슷하다(1.6배 이하).
+    """
+    hx0, hy0, hx1, hy1 = head
+    tx0, ty0, tx1, ty1 = tail
+    xc = (tx0 + tx1) / 2.0
+    if not (hx0 - 1.0 <= xc <= hx1 + 1.0):
+        return False
+    if not (-4.0 <= ty0 - hy1 <= 8.0):
+        return False
+    return (ty1 - ty0) <= 1.6 * (hy1 - hy0)
+
+
+# 병합 칸: 같은 칸이 두 행 이상에 걸쳐 있으면 그 사이 가로 경계선이 이 칸에서만 끊긴다.
+MERGED_CELL_GAP_COVER_MAX = 0.2  # 칸 너비 중 가로선이 덮는 비율이 이 이하면 끊긴 것
+MERGED_CELL_ROW_COVER_MIN = 0.5  # 같은 경계에서 표 전체 너비 중 가로선이 덮는 비율이 이 이상이면 행 경계가 있다
+
+
+def _cover(segs: list[tuple[float, float]], a: float, b: float) -> float:
+    """가로선 조각 목록이 [a,b] 를 덮는 길이."""
+    if b <= a:
+        return 0.0
+    spans = sorted((max(s0, a), min(s1, b)) for s0, s1 in segs if min(s1, b) > max(s0, a))
+    total = 0.0
+    cur_e = a
+    for s0, s1 in spans:
+        s0 = max(s0, cur_e)
+        if s1 > s0:
+            total += s1 - s0
+            cur_e = s1
+    return total
+
+
+def boundary_splits_cell(
+    segs: list[tuple[float, float]],
+    cell: tuple[float, float],
+    table: tuple[float, float],
+) -> bool:
+    """한 행 경계(같은 y 의 가로선 조각들)가 cell 열을 가르지 않고 다른 열에는 있는가.
+
+    segs 는 그 경계 y 에 있는 가로선 조각 (x0, x1) 목록, cell 은 칸 x 범위, table 은 표 x 범위.
+    표 안쪽 다른 열은 가로선이 있는데 이 칸만 끊겼으면 칸이 아래 행까지 이어진 병합 칸이다.
+    """
+    cw = cell[1] - cell[0]
+    rest = (table[1] - table[0]) - cw
+    if cw <= 0 or rest <= 0:
+        return False
+    in_cell = _cover(segs, cell[0], cell[1])
+    in_table = _cover(segs, table[0], table[1])
+    others = in_table - in_cell
+    return in_cell <= cw * MERGED_CELL_GAP_COVER_MAX and others >= rest * MERGED_CELL_ROW_COVER_MIN
+
+
+# --- 그림 영역(F2-a) ---
+# 그림 제목 줄([표준도]·[그림) 아래에서, 도면 벡터 묶음·이미지 안에 있는 글자는
+# 도면 라벨이다(5pt 이상이라 FIGURE_GLYPH_MAX_H_PT 거름에 걸리지 않는다).
+FIGURE_REGION_MIN_W_PT = 80.0
+FIGURE_REGION_MIN_H_PT = 40.0
+
+
+def figure_regions(page) -> list[tuple[float, float, float, float]]:
+    """쪽의 도면 영역(벡터 묶음·이미지 상자) 목록. 너무 작은 것은 뺀다. page 는 PyMuPDF Page."""
+    out: list[tuple[float, float, float, float]] = []
+    try:
+        clusters = page.cluster_drawings()
+    except Exception:
+        clusters = []
+    for r in clusters:
+        if r.width >= FIGURE_REGION_MIN_W_PT and r.height >= FIGURE_REGION_MIN_H_PT:
+            out.append((float(r.x0), float(r.y0), float(r.x1), float(r.y1)))
+    try:
+        infos = page.get_image_info()
+    except Exception:
+        infos = []
+    for im in infos:
+        b = im.get("bbox")
+        if not b or len(b) != 4:
+            continue
+        if (b[2] - b[0]) >= FIGURE_REGION_MIN_W_PT and (b[3] - b[1]) >= FIGURE_REGION_MIN_H_PT:
+            out.append((float(b[0]), float(b[1]), float(b[2]), float(b[3])))
+    return out
+
+
+def in_figure_area(
+    xc: float,
+    yc: float,
+    caption_bottom: float | None,
+    regions: list[tuple[float, float, float, float]],
+) -> bool:
+    """그림 제목 줄 아래(caption_bottom 보다 아래)의 도면 영역 안에 있는 점인가."""
+    if caption_bottom is None or yc <= caption_bottom:
+        return False
+    return any(x0 <= xc <= x1 and y0 <= yc <= y1 for x0, y0, x1, y1 in regions)
+
+
+# --- 축소 ■ 제목(F2-e) ---
+# 원문 조판 결함: 어떤 그룹의 제목·【단가정의】 ①②가 도면 위 1~4pt 축소 글자로만 찍혀
+# 있다(2016H1 p49 AE14*). 축소 ■ 제목은 그 아래 첫 본문 코드가 제목의 코드 접두와
+# 같고 그 사이에 (5pt 이상) 실제 ■ 제목이 없을 때만 그룹 경계로 인정한다.
+# 그 밖(2016H1 p52 등 도면 안 축소 사본 페이지)은 그룹이 아니다.
+TINY_TITLE_RE = re.compile(r"^■\s*([A-Z]{2}\d+)\*")
+
+
+def accept_tiny_titles(
+    titles: list[tuple[float, str]],
+    real_header_ys: list[float],
+    code_rows: list[tuple[float, str]],
+) -> list[float]:
+    """받아들일 축소 ■ 제목의 y 목록.
+
+    titles: [(yc, 공백 없는 글줄)], real_header_ys: 같은 단 실제 ■ 줄 y,
+    code_rows: [(yc, 코드)] 같은 단 본문 코드 행.
+    """
+    accepted: dict[float, float] = {}  # 첫 코드 yc -> 제목 yc (같은 코드에 여러 제목이면 마지막)
+    for yt, txt in sorted(titles):
+        m = TINY_TITLE_RE.match(txt.replace(" ", ""))
+        if not m:
+            continue
+        below = sorted((y, c) for y, c in code_rows if y > yt)
+        if not below:
+            continue
+        yc, code = below[0]
+        if not code.startswith(m.group(1)):
+            continue
+        if any(yt < ry < yc for ry in real_header_ys):
+            continue
+        accepted[yc] = yt
+    return sorted(accepted.values())

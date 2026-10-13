@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pymupdf as fitz
@@ -22,6 +22,7 @@ from .spec import (
     CODE_FIND,
     CODE_FULL,
     CODE_RE,
+    CODE_WRAP_HEAD_RE,
     FIELD_RE_PDF as FIELD_RE,
     FIGURE_CAPTION_PREFIXES,
     HALF_FMT_RE,
@@ -39,7 +40,12 @@ from .spec import (
     TEXT_LAYER_SPACE_RATIO_MIN,
     UNIT_NORM,
     VLINE_MIN_LEN_PT,
+    accept_tiny_titles,
+    boundary_splits_cell,
+    code_tail_below,
+    figure_regions,
     hangul_span_space_ratio,
+    in_figure_area,
     is_figure_glyph_h,
     landscape_gutter_x,
 )
@@ -162,6 +168,14 @@ class Span:
 
 
 @dataclass
+class TinyTitleSpan(Span):
+    """F2-e: 축소 글자로만 찍힌 ■ 그룹 제목(그 아래 축소 【단가정의】 줄 포함). 그룹 이벤트 payload."""
+
+    raw: str = ""
+    note_lines: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LineSeg:
     a: float
     b: float
@@ -212,7 +226,8 @@ def _fix_pua_spans(spans: list[Span]) -> None:
             s.text = "".join(out_chars)
 
 
-def _page_spans(page: fitz.Page) -> list[Span]:
+def _page_spans(page: fitz.Page, tiny_out: list[Span] | None = None) -> list[Span]:
+    """쪽의 글 덩어리. 도식 축소 글자(FIGURE_GLYPH_MAX_H_PT 미만)는 빼되, tiny_out 이 있으면 거기 모은다."""
     out: list[Span] = []
     d = page.get_text("dict")
     for b in d.get("blocks", []):
@@ -226,6 +241,8 @@ def _page_spans(page: fitz.Page) -> list[Span]:
                 x0, y0, x1, y1 = s["bbox"]
                 fy0, fy1 = float(y0), float(y1)
                 if is_figure_glyph_h(fy0, fy1):
+                    if tiny_out is not None:
+                        tiny_out.append(Span(float(x0), fy0, float(x1), fy1, t, float(s.get("size") or 0.0)))
                     continue
                 out.append(Span(float(x0), fy0, float(x1), fy1, t, float(s.get("size") or 0.0)))
     _fix_pua_spans(out)
@@ -809,6 +826,24 @@ def _codes_and_stars(spans: list[Span], x0: float, x1: float) -> tuple[list[Span
                 continue
             cw = min(s.x1 - s.x0, 78.0)
             codes.append(Span(s.x0, s.y0, s.x0 + cw, s.y1, m.group()))
+    # F2-c: 코드 칸 안에서 줄이 꺾여 「ND109.1112」+ 아래 줄 「1」 처럼 두 줄로 찍힌 코드를 잇는다.
+    for h in spans:
+        if not (x0 - 2 <= h.x0 < x1) or h.x0 > x0 + half_w * 0.28:
+            continue
+        if not CODE_WRAP_HEAD_RE.match(h.text.strip()):
+            continue
+        tails = [
+            t
+            for t in spans
+            if t is not h
+            and re.fullmatch(r"\d", t.text.strip() or "x")
+            and code_tail_below((h.x0, h.y0, h.x1, h.y1), (t.x0, t.y0, t.x1, t.y1))
+        ]
+        if len(tails) != 1:
+            continue
+        t = tails[0]
+        cw = min(h.x1 - h.x0, 78.0)
+        codes.append(Span(h.x0, h.y0, h.x0 + cw, t.y1, h.text.strip() + t.text.strip()))
     return codes, stars
 
 
@@ -1754,6 +1789,74 @@ def _reassign_empty_page_fields(pages_out: list[dict], content_pages: set[int]) 
             page["field"] = next_field
 
 
+def _tiny_lines(tiny: list[Span], gap: float = 2.0) -> list[tuple[float, list[Span]]]:
+    """축소 글자 글덩어리를 줄(y 가까운 것끼리)로 묶는다. [(y중심, 글덩어리 목록)] 위에서 아래로."""
+    if not tiny:
+        return []
+    ordered = sorted(tiny, key=lambda s: (s.yc, s.x0))
+    lines: list[list[Span]] = []
+    for s in ordered:
+        if lines:
+            prev_yc = sum(x.yc for x in lines[-1]) / len(lines[-1])
+            if abs(s.yc - prev_yc) <= max(gap, (s.y1 - s.y0) * 0.45):
+                lines[-1].append(s)
+                continue
+        lines.append([s])
+    return [(sum(x.yc for x in ln) / len(ln), ln) for ln in lines]
+
+
+def _caption_bottom(spans: list[Span]) -> float | None:
+    """줄 첫머리가 그림 제목([표준도]·[그림)인 줄 가운데 가장 위 줄의 아랫끝 y. 없으면 None."""
+    if not spans:
+        return None
+    ordered = sorted(spans, key=lambda s: (s.y0, s.x0))
+    lines: list[list[Span]] = []
+    for s in ordered:
+        if not lines:
+            lines.append([s])
+            continue
+        prev_yc = sum(x.yc for x in lines[-1]) / len(lines[-1])
+        if abs(s.yc - prev_yc) <= max(6.0, (s.y1 - s.y0) * 0.45):
+            lines[-1].append(s)
+        else:
+            lines.append([s])
+    for ln in lines:
+        if _is_figure_caption_line(_join_line(ln).strip()):
+            return max(s.y1 for s in ln)
+    return None
+
+
+def _drop_figure_area_spans(band: list[Span], regions_of, cap: float | None) -> list[Span]:
+    """band 에서 그림 제목 줄(아랫끝 cap) 아래 도면 영역 안 글덩어리를 뺀다(regions_of() 는 쪽 도면 영역 목록)."""
+    if cap is None:
+        return band
+    regions = regions_of()
+    if not regions:
+        return band
+    return [s for s in band if not in_figure_area(s.xc, s.yc, cap, regions)]
+
+
+def _row_boundary_splits_cell(
+    hlines: list[LineSeg],
+    yc_a: float,
+    yc_b: float,
+    cell: tuple[float, float],
+    table: tuple[float, float],
+) -> bool:
+    """두 행(코드 가운데 y 가 yc_a < yc_b) 사이 경계에서 cell 열만 가로선이 끊겼는가(병합 칸)."""
+    ys = _cluster_xs([h.c for h in hlines if yc_a < h.c < yc_b and h.b > table[0] and h.a < table[1]], tol=1.6)
+    best: list[tuple[float, float]] | None = None
+    best_cov = 0.0
+    for y in ys:
+        segs = [(h.a, h.b) for h in hlines if abs(h.c - y) <= 1.6]
+        cov = sum(max(0.0, min(b, table[1]) - max(a, table[0])) for a, b in segs)
+        if cov > best_cov:
+            best, best_cov = segs, cov
+    if not best:
+        return False
+    return boundary_splits_cell(best, cell, table)
+
+
 def _row_bands(
     centers: list[float],
     hlines: list[LineSeg],
@@ -1865,6 +1968,9 @@ def extract_pdf(
     table_seq = TableSeq()
     current_title: str | None = None
     in_note_zone = False
+    # F2-e: 쪽 끝에 (본문 아래) 도면 안 축소 ■ 사본이 있으면, 다음 쪽 맨 위(첫 ■·표·단가정의 앞)
+    # 글줄은 그 사본 그룹의 이어짐이지 직전 그룹의 주석이 아니다. 단(L/R/C)별 상태.
+    miniature_open: dict[str, bool] = {}
 
     # --pages 중간부터여도 앞쪽 배너를 읽어 대분류를 이어받는다
     if start > 1:
@@ -1892,7 +1998,8 @@ def extract_pdf(
             last_group = None
             current_title = None
             in_note_zone = False
-        spans_all = _page_spans(page)
+        tiny_all: list[Span] = []
+        spans_all = _page_spans(page, tiny_all)
         chars_all = _page_chars(page)
         page_chars[pno] = chars_all
         for s in spans_all:
@@ -1914,6 +2021,15 @@ def extract_pdf(
         except Exception:
             tables = []
         table_cache[pno] = snapshot_page_tables(tables)
+
+        # F2-a: 그림 제목 줄이 있는 주석 띠에서만 도면 영역을 계산한다(쪽당 한 번).
+        fig_regions_holder: dict[str, list] = {}
+
+        def _page_figure_regions(_h=fig_regions_holder, _p=page) -> list:
+            if "r" not in _h:
+                _h["r"] = figure_regions(_p)
+            return _h["r"]
+
         printed_map: dict[str, int] = {}
         min_w = page.rect.width * (0.35 if layout == "landscape_2up" else 0.45)
 
@@ -2001,6 +2117,59 @@ def extract_pdf(
                 events.append((cl[0][1].yc, "table", cl))
             for d in dangas:
                 events.append((d.yc, "notes", d))
+            # F2-e: 축소 ■ 제목 — 아래 첫 본문 코드가 제목의 코드 접두와 같고 그 사이에 실제 ■ 가
+            # 없을 때만 그룹 경계로 인정한다(도면 안 축소 사본 페이지는 그룹이 아니다).
+            tiny_half = [t for t in tiny_all if _in_half(t, hx0, hx1)]
+            tiny_title_lines: list[tuple[float, list[Span]]] = []
+            unaccepted_tiny_ys: list[float] = []
+            if tiny_half:
+                tl = _tiny_lines(tiny_half)
+                tiny_title_lines = [
+                    (yc, ln)
+                    for yc, ln in tl
+                    if "".join(t.text for t in sorted(ln, key=lambda z: z.x0)).replace(" ", "").startswith("■")
+                ]
+                code_rows = sorted((c.yc, c.text) for c in rec_codes)
+                acc_ys = accept_tiny_titles(
+                    [
+                        (yc, "".join(t.text for t in sorted(ln, key=lambda z: z.x0)))
+                        for yc, ln in tiny_title_lines
+                    ],
+                    [g.yc for g in gheads],
+                    code_rows,
+                )
+                unaccepted_tiny_ys = [yc for yc, _ln in tiny_title_lines if yc not in acc_ys]
+                for yt in acc_ys:
+                    ln = next(l for y, l in tiny_title_lines if y == yt)
+                    ln_sorted = sorted(ln, key=lambda z: z.x0)
+                    tsize = max(t.size for t in ln_sorted)
+                    below_codes = [y for y, _c in code_rows if y > yt]
+                    y_stop = min(below_codes) if below_codes else yt
+                    next_titles = [y for y, _l in tiny_title_lines if y > yt]
+                    if next_titles:
+                        y_stop = min(y_stop, min(next_titles))
+                    note_lines = [
+                        _collapse(_join_line(sorted(l2, key=lambda z: z.x0)))
+                        for y2, l2 in tl
+                        if yt < y2 < y_stop and abs(max(t.size for t in l2) - tsize) <= 0.3
+                    ]
+                    first = ln_sorted[0]
+                    events.append(
+                        (
+                            yt,
+                            "group",
+                            TinyTitleSpan(
+                                first.x0,
+                                first.y0,
+                                ln_sorted[-1].x1,
+                                first.y1,
+                                first.text,
+                                first.size,
+                                raw=_collapse(_join_line(ln_sorted)),
+                                note_lines=[t for t in note_lines if t],
+                            ),
+                        )
+                    )
             events.sort(key=lambda e: (e[0], _EV_ORDER.get(e[1], 9)))
 
             current_group = None  # assigned after first ■ on this half
@@ -2014,7 +2183,10 @@ def extract_pdf(
                 last_prev_name = ""
                 current_title = None
                 in_note_zone = False
-                raw = _line_text_at(spans, header_span.yc, hx0, hx1, tol=10)
+                if isinstance(header_span, TinyTitleSpan):
+                    raw = header_span.raw
+                else:
+                    raw = _line_text_at(spans, header_span.yc, hx0, hx1, tol=10)
                 if raw.startswith("■") and len(raw) > 1 and raw[1] != " ":
                     raw = "■ " + raw[1:]
                 if not raw.startswith("■"):
@@ -2194,6 +2366,8 @@ def extract_pdf(
                 # 앞 항목의 이어짐이 아니다). 쉼표도 구분자로 보고 없앤 뒤 비교한다.
                 have_sub_blob = re.sub(r"[\s|/,]+", "", "".join(t for _, t in table_entries))
                 band = [s for s in spans if y0 < s.yc < y1]
+                # F2-a: 그림 제목 줄 위치는 표 상자 거름 전 띠에서 잡는다(상자가 「[표준도]」 글자를 덮을 수 있다).
+                band_cap = _caption_bottom(band)
                 if figure_boxes:
                     band = [
                         s
@@ -2203,6 +2377,10 @@ def extract_pdf(
                             for fb in figure_boxes
                         )
                     ]
+                # F2-a: 그림 제목 줄([표준도]·[그림) 아래 도면 영역(벡터 묶음·이미지) 안의 글자는
+                # 도면 라벨이다 — 5pt 이상이라 축소 글자 거름에 안 걸린 것(「초잡석」「1h」「버림콘크」)을
+                # 주석 줄 모으기에서 뺀다. 낱말 목록이 아니라 쪽 도면 영역 기하로 판정한다.
+                band = _drop_figure_area_spans(band, _page_figure_regions, band_cap)
                 raw_lines_y = _cluster_lines_y(band, gap=6.0)
                 line_eols = _eol_spaces_for_lines(
                     chars, [yc for yc, _ in raw_lines_y], hx0, hx1
@@ -2320,7 +2498,8 @@ def extract_pdf(
             if first_group_y is not None and first_group_y == top_limit:
                 top_limit -= 1.5
             has_early_notes = first_notes_y is not None and first_notes_y < top_limit - 1
-            if last_group is not None and not has_early_notes and top_limit > 40:
+            suppress_top = miniature_open.get(ph, False)
+            if last_group is not None and not has_early_notes and top_limit > 40 and not suppress_top:
                 attach_notes_from(8.0, top_limit, last_group)
 
             for i_ev, (ey, etype, payload) in enumerate(events):
@@ -2347,6 +2526,15 @@ def extract_pdf(
                 elif etype == "group":
                     current_group = new_group(payload)  # type: ignore[arg-type]
                     half_started = True
+                    if isinstance(payload, TinyTitleSpan) and payload.note_lines:
+                        t_items = _note_items(payload.note_lines, pno, None)
+                        if t_items:
+                            current_title = None
+                            in_note_zone = True
+                            t_gid = current_group.get("group_id")
+                            for it in t_items:
+                                it["table_seq"] = table_seq.note_seen(t_gid)
+                            current_group["notes"].extend(t_items)
                 elif etype == "table":
                     cl: list[tuple[str, Span]] = payload  # type: ignore[assignment]
                     # group assignment
@@ -2380,6 +2568,12 @@ def extract_pdf(
                     wide = _wide_h(hlines, y_top_search, y_max + 40, min_w * 0.8)
                     # restrict to this half
                     wide = [h for h in wide if h.a < hx1 - 20 and h.b > hx0 + 20]
+                    # F2-b: 같은 y 띠에 도면 가로선이 섞이면 선이 쪽 왼쪽 가장자리 밖(x<0)까지 뻗어
+                    # 표 상자 x0 가 가장자리(2.0)로 눌린다(2017H1~2019H2 p97 HA219.42000·HA229.42000).
+                    # 쪽 밖으로 뻗은 도면 선은 표 격자 선이 아니므로, 다른 격자 선이 있으면 뺀다.
+                    wide_in = [h for h in wide if h.a >= hx0]
+                    if wide_in:
+                        wide = wide_in
                     if wide:
                         table_x0 = min(h.a for h in wide)
                         table_x1 = max(h.b for h in wide)
@@ -2468,8 +2662,48 @@ def extract_pdf(
                     remark_col = colmap.get("remark")
                     has_remark = remark_col is not None
 
+                    # F2-d: 명칭 칸 하나가 두 행 이상에 걸쳐 병합돼 있으면(행 사이 가로선이 이
+                    # 칸에서만 끊김) 칸 글 전체가 그 칸이 걸친 모든 행의 명칭 원문이다.
+                    merged_first: dict[int, tuple[str, list[float]]] = {}
+                    merged_cont: set[int] = set()
+                    name_cell = (name_col[0], name_col[1])
+                    mi = 0
+                    while mi < len(items_sorted):
+                        if items_sorted[mi][0] != "code":
+                            mi += 1
+                            continue
+                        mj = mi
+                        while (
+                            mj + 1 < len(items_sorted)
+                            and items_sorted[mj + 1][0] == "code"
+                            and _row_boundary_splits_cell(
+                                hlines,
+                                items_sorted[mj][1].yc,
+                                items_sorted[mj + 1][1].yc,
+                                name_cell,
+                                (table_x0, table_x1),
+                            )
+                        ):
+                            mj += 1
+                        if mj > mi:
+                            mtext = _cell_text(
+                                words_all, chars, name_cell[0], name_cell[1], bands[mi][0], bands[mj][1], real_vxs
+                            )
+                            if mtext.strip() and not _is_inherit(mtext):
+                                merged_first[mi] = (
+                                    mtext,
+                                    [
+                                        round(name_cell[0], 1),
+                                        round(bands[mi][0], 1),
+                                        round(name_cell[1], 1),
+                                        round(bands[mj][1], 1),
+                                    ],
+                                )
+                                merged_cont.update(range(mi + 1, mj + 1))
+                        mi = mj + 1
+
                     prev_name = last_prev_name
-                    for (kind, sp), (y0, y1) in zip(items_sorted, bands):
+                    for idx_row, ((kind, sp), (y0, y1)) in enumerate(zip(items_sorted, bands)):
                         if kind == "star":
                             pat = sp.text.strip()
                             # 소제목 텍스트: 코드 열 오른쪽 전체
@@ -2489,7 +2723,13 @@ def extract_pdf(
                             continue
 
                         code = sp.text.strip()
-                        name_raw = _cell_text(words_all, chars, name_col[0], name_col[1], y0, y1, real_vxs)
+                        if idx_row in merged_first:
+                            name_raw = merged_first[idx_row][0]
+                        elif idx_row in merged_cont:
+                            # 병합 칸의 둘째 행 이후: 이 행 칸에는 글이 없다(첫 행이 칸 전체를 가진다).
+                            name_raw = ""
+                        else:
+                            name_raw = _cell_text(words_all, chars, name_col[0], name_col[1], y0, y1, real_vxs)
                         spec_raw = _cell_text(words_all, chars, spec_col[0], spec_col[1], y0, y1, real_vxs)
                         unit_raw = _cell_text(words_all, chars, unit_col[0], unit_col[1], y0, y1, real_vxs)
                         price_raw0 = _cell_text(words_all, chars, price_col[0], price_col[1], y0, y1, real_vxs)
@@ -2568,7 +2808,10 @@ def extract_pdf(
                         name_blank = not re.sub(r"\s+", "", name_raw or "")
                         inherited = _is_inherit(name_raw) or name_blank
                         name_group = current_sub[0] if current_sub else None
-                        if inherited:
+                        if idx_row in merged_cont:
+                            # 병합 칸 둘째 행 이후의 명칭은 그 칸 첫 행의 명칭(소제목이 아니다).
+                            name = prev_name
+                        elif inherited:
                             name = current_sub[1] if current_sub else prev_name
                             if not name:
                                 warnings.append(
@@ -2628,6 +2871,8 @@ def extract_pdf(
                             "status": status,
                             "source_sha256": sha,
                         }
+                        if idx_row in merged_first:
+                            rec["name_cell_bbox"] = merged_first[idx_row][1]
                         if inherited and current_sub:
                             rec["name_group"] = current_sub[0]
                         if not inherited:
@@ -2692,6 +2937,17 @@ def extract_pdf(
             # 쪽 맨 위 이어지는 주석 (번호만)
             if events and events[0][1] != "group":
                 pass
+
+            # F2-e: 이 단 본문 맨 아래보다 더 아래에 인정 안 된 축소 ■ 사본이 있으면 다음 쪽 맨 위는
+            # 그 사본 그룹의 이어짐이다. 사건(■·표·단가정의)이 없는 쪽은 그 상태를 이어간다.
+            real_ys = [
+                sp.yc for sp in spans if sp.text.strip() and sp.yc < page.rect.height * 0.92
+            ]
+            last_real_y = max(real_ys) if real_ys else 0.0
+            has_struct_ev = any(e[1] in ("group", "table", "notes") for e in events)
+            miniature_open[ph] = any(yt > last_real_y for yt in unaccepted_tiny_ys) or (
+                suppress_top and not has_struct_ev
+            )
 
         pages_out.append(
             {

@@ -18,6 +18,11 @@ from .spec import (
     CIRCLED_CHARS,
     CODE_FULL,
     CODE_RE,
+    CODE_WRAP_HEAD_RE,
+    accept_tiny_titles,
+    code_tail_below,
+    figure_regions,
+    in_figure_area,
     FIGURE_CAPTION_PREFIXES,
     HALF_LABOR_RE,
     HEADER_NORM,
@@ -259,7 +264,39 @@ def _words(page: fitz.Page) -> list[tuple[float, float, float, float, str]]:
                         new_t.append(ch)
                 fixed_rows.append((x0, y0, x1, y1, "".join(new_t)))
             rows = fixed_rows
-    return rows
+    return _merge_wrapped_codes(rows)
+
+
+def _merge_wrapped_codes(
+    rows: list[tuple[float, float, float, float, str]]
+) -> list[tuple[float, float, float, float, str]]:
+    """F2-c: 칸 안에서 줄이 꺾여 「ND109.1112」+ 아래 줄 「1」 로 찍힌 공종코드를 한 낱말 코드로 잇는다.
+
+    순수 기하(spec.code_tail_below): 앞 열 자리 낱말과 그 바로 아래 같은 칸의 낱글자 숫자 하나.
+    """
+    heads = [i for i, r in enumerate(rows) if CODE_WRAP_HEAD_RE.match(r[4].strip())]
+    if not heads:
+        return rows
+    drop: set[int] = set()
+    merged: dict[int, tuple[float, float, float, float, str]] = {}
+    for i in heads:
+        hx0, hy0, hx1, hy1, ht = rows[i]
+        tails = [
+            j
+            for j, r in enumerate(rows)
+            if j != i
+            and j not in drop
+            and r[4].strip().isdigit()
+            and len(r[4].strip()) == 1
+            and code_tail_below((hx0, hy0, hx1, hy1), (r[0], r[1], r[2], r[3]))
+        ]
+        if len(tails) != 1:
+            continue
+        j = tails[0]
+        t = rows[j]
+        drop.add(j)
+        merged[i] = (min(hx0, t[0]), hy0, max(hx1, t[2]), t[3], ht.strip() + t[4].strip())
+    return [merged.get(i, r) for i, r in enumerate(rows) if i not in drop]
 
 
 def _header_ys(
@@ -517,6 +554,18 @@ def _record_blob(rec: dict) -> str:
     return "\n".join(parts)
 
 
+def _in_rec_area(rec: dict, xc: float, yc: float) -> bool:
+    """낱말 가운데가 레코드 상자 안인가. 병합 명칭 칸(name_cell_bbox, 칸이 걸친 모든 행)도 그 레코드의 자리다."""
+    for key, tol in (("bbox", 1.0), ("name_cell_bbox", 1.0)):
+        bb = rec.get(key)
+        if not bb or len(bb) != 4:
+            continue
+        bx0, by0, bx1, by1 = (float(v) for v in bb)
+        if by0 - 0.4 <= yc < by1 + 0.4 and bx0 - tol <= xc <= bx1 + tol:
+            return True
+    return False
+
+
 def _assign(
     word: tuple[float, float, float, float, str],
     records: list[dict],
@@ -529,11 +578,7 @@ def _assign(
     xc, yc = (x0 + x1) / 2, (y0 + y1) / 2
     hits: list[str] = []
     for rec in records:
-        bbox = rec.get("bbox") or [0, 0, 0, 0]
-        if len(bbox) != 4:
-            continue
-        bx0, by0, bx1, by1 = (float(v) for v in bbox)
-        if not (by0 - 0.4 <= yc < by1 + 0.4 and bx0 - 1.0 <= xc <= bx1 + 1.0):
+        if not _in_rec_area(rec, xc, yc):
             continue
         if _word_in_text(text, _record_blob(rec), allow_digit=allow_digit):
             hits.append(rec.get("key") or rec.get("code") or "?")
@@ -1609,6 +1654,11 @@ def _augment_order_with_headers(
         page = doc[pno - 1]
         scanned_words = (page_scan or {}).get(pno, {}).get("words")
         words = scanned_words if scanned_words is not None else _words(page)
+        # F2-e: 받아들인 축소 ■ 제목도 그룹 머리글 위치다.
+        tiny_scan = (page_scan or {}).get(pno, {}).get("tiny")
+        if tiny_scan is None:
+            tiny_scan = _tiny_scan(page, words, _wide_h(page))
+        words = list(words) + tiny_scan["words"]
         hx0 = hx1 = None
         for _p, x0, x1 in _halves(page):
             if _p == ph:
@@ -1632,6 +1682,65 @@ def _augment_order_with_headers(
                 y0, y1, gg = rows[i]
                 rows[i] = (min(y0, y), y1, gg)
         rows.sort(key=lambda t: t[0])
+
+
+def _tiny_scan(
+    page: fitz.Page,
+    words: list[tuple[float, float, float, float, str]],
+    hlines: list[tuple[float, float, float]],
+) -> dict[str, Any]:
+    """F2-e: 축소 글자(FIGURE_GLYPH_MAX_H_PT 미만)로만 찍힌 ■ 그룹 제목·【단가정의】 항목.
+
+    추출 코드와 별개로 원자료(words)만으로 다시 판정한다. 반환:
+      words    — 받아들인 축소 ■ 제목(그룹 경계)의 제목 줄 + 그 아래 같은 크기 축소 줄 낱말
+      accepted — {단: [받아들인 제목 y]}
+      below    — {단: 인정 안 된 축소 ■ 사본이 그 단 본문 맨 아래보다 아래에 있는가}
+    """
+    out: dict[str, Any] = {"words": [], "accepted": {}, "below": {}}
+    tiny: list[tuple[float, float, float, float, str]] = []
+    for w in page.get_text("words"):
+        t = w[4]
+        if not t:
+            continue
+        y0, y1 = float(w[1]), float(w[3])
+        if is_figure_glyph_h(y0, y1):
+            tiny.append((float(w[0]), y0, float(w[2]), y1, t))
+    if not any("■" in w[4] for w in tiny):
+        return out
+    layout_minw = page.rect.width * (0.35 if page.rect.width > page.rect.height else 0.45)
+    for ph, hx0, hx1 in _halves(page):
+        th = [w for w in tiny if hx0 - 1 <= (w[0] + w[2]) / 2 < hx1 + 1]
+        ww = [w for w in words if hx0 - 1 <= (w[0] + w[2]) / 2 < hx1 + 1]
+        tx0, tx1 = _table_x(hlines, 0, page.rect.height, hx0, hx1, layout_minw)
+        codes = _rec_codes(ww, hx0, hx1, table_x0=tx0, table_x1=tx1)
+        lines: list[tuple[float, float, list[tuple[float, float, float, float, str]]]] = []
+        for ln in _cluster_word_lines(th, gap=2.0):
+            ln_s = sorted(ln, key=lambda w: w[0])
+            yc = sum((w[1] + w[3]) / 2.0 for w in ln_s) / len(ln_s)
+            lines.append((yc, max(w[3] - w[1] for w in ln_s), ln_s))
+        titles = [
+            (yc, "".join(w[4] for w in ln_s))
+            for yc, _h, ln_s in lines
+            if "".join(w[4] for w in ln_s).replace(" ", "").startswith("■")
+        ]
+        acc = accept_tiny_titles(titles, _group_ys(ww, hx0, hx1), [(c[1], c[0]) for c in codes])
+        out["accepted"][ph] = acc
+        for yt in acc:
+            tl = next(item for item in lines if item[0] == yt)
+            below_codes = [c[1] for c in codes if c[1] > yt]
+            y_stop = min(below_codes) if below_codes else yt
+            nxt = [y for y, _t in titles if y > yt]
+            if nxt:
+                y_stop = min(y_stop, min(nxt))
+            for yc, h, ln_s in lines:
+                if yc == yt or (yt < yc < y_stop and abs(h - tl[1]) <= 0.6):
+                    out["words"].extend(ln_s)
+        real_ys = [
+            (w[1] + w[3]) / 2.0 for w in ww if (w[1] + w[3]) / 2.0 < page.rect.height * 0.92
+        ]
+        last_real = max(real_ys) if real_ys else 0.0
+        out["below"][ph] = any(y > last_real for y, _t in titles if y not in acc)
+    return out
 
 
 def _note_word_gate(
@@ -1701,6 +1810,7 @@ def _note_word_gate(
     order_seq: dict[Any, list[str]] = {}
     gate_page_errors: list[dict[str, Any]] = []
     range_pages = (start, end)
+    mini_open: dict[str, bool] = {}
 
     for pno in range(start, end + 1):
         page = doc[pno - 1]
@@ -1708,9 +1818,34 @@ def _note_word_gate(
         if scanned:
             words = scanned["words"]
             bodies = scanned["bodies"]
+            tiny = scanned.get("tiny")
         else:
             words = _words(page)
             bodies = _table_bodies(page, words=words)
+            tiny = None
+        if tiny is None:
+            tiny = _tiny_scan(page, words, _wide_h(page))
+        real_words = words
+        words = real_words + tiny["words"]
+        # F2-e: 앞 쪽 끝에 인정 안 된 축소 ■ 사본이 있었으면 이 쪽 맨 위(첫 ■·표·단가정의 앞) 글은
+        # 그 사본 그룹의 이어짐이라 직전 그룹 주석에서 뺀다(추출 코드와 같은 규칙).
+        suppress_top: dict[str, bool] = {}
+        top_cut: dict[str, float] = {}
+        for _ph2, _hx0, _hx1 in _halves(page):
+            ww_real = [w for w in real_words if _hx0 - 1 <= (w[0] + w[2]) / 2 < _hx1 + 1]
+            gys_h = _group_ys(ww_real, _hx0, _hx1)
+            dys_h = _danga_ys(ww_real, _hx0, _hx1)
+            hdr_h = _header_ys(ww_real, _hx0, _hx1)
+            bodies_h = [b for b in bodies if b[0] < _hx1 - 1 and b[2] > _hx0 + 1]
+            acc_h = tiny["accepted"].get(_ph2, [])
+            suppress_top[_ph2] = mini_open.get(_ph2, False)
+            top_cut[_ph2] = min(
+                gys_h + [h - 3.0 for h in hdr_h] + [b[1] for b in bodies_h] + list(acc_h),
+                default=float("inf"),
+            )
+            has_struct = bool(gys_h or dys_h or bodies_h or acc_h)
+            mini_open[_ph2] = bool(tiny["below"].get(_ph2)) or (suppress_top[_ph2] and not has_struct)
+        fig_regions_page: list | None = None
         image_boxes = _image_boxes(page, gate_page_errors)
         cached = table_cache.get(pno) if table_cache is not None else None
         page_tables = _page_tables(page, cached=cached, errors=gate_page_errors)
@@ -1790,9 +1925,27 @@ def _note_word_gate(
                     continue
 
             band_words = _align_subtable_row_words(band_words_pre, note_subtables)
-            for line in _cluster_word_lines(band_words):
+            # F2-e: 받아들인 축소 ■ 제목 블록(1~4pt 글자)은 줄 간격이 좁아 일반 묶음 간격이면
+            # 한 줄로 뭉친다 — 축소 낱말은 따로, 좁은 간격으로 줄을 묶는다.
+            band_lines = sorted(
+                _cluster_word_lines([w for w in band_words if not is_figure_glyph_h(w[1], w[3])])
+                + _cluster_word_lines([w for w in band_words if is_figure_glyph_h(w[1], w[3])], gap=2.0),
+                key=lambda ln: sum((w[1] + w[3]) / 2.0 for w in ln) / len(ln),
+            )
+            # F2-a: 그림 제목 줄([표준도]·[그림) 아래 도면 영역 안 낱말은 도면 라벨이다.
+            band_cap_bottom: float | None = None
+            for _ln in band_lines:
+                _txt = " ".join(w[4] for w in sorted(_ln, key=lambda w: w[0])).strip()
+                if _txt.startswith(FIGURE_CAPTION_PREFIXES):
+                    band_cap_bottom = max(w[3] for w in _ln)
+                    break
+            if band_cap_bottom is not None and fig_regions_page is None:
+                fig_regions_page = figure_regions(page)
+            for line in band_lines:
                 sorted_line = sorted(line, key=lambda w: w[0])
                 line_yc = sum((w[1] + w[3]) / 2.0 for w in line) / len(line)
+                if suppress_top.get(ph) and line_yc < top_cut.get(ph, float("inf")):
+                    continue
                 owner = _owner_at(line_yc)
                 if owner is None:
                     continue
@@ -1862,10 +2015,16 @@ def _note_word_gate(
                         bx0 - 1 <= xc <= bx1 + 1 and by0b - 1 <= yc2 <= by1b + 1
                         for bx0, by0b, bx1, by1b in legend_boxes
                     )
+                    in_fig_area = (
+                        band_cap_bottom is not None
+                        and not is_caption_line
+                        and in_figure_area(xc, yc2, band_cap_bottom, fig_regions_page or [])
+                    )
                     is_diagram_word = (
                         not is_caption_line
                         and (
                             in_legend_box
+                            or in_fig_area
                             or is_diagram_line
                             or _is_figure_word(
                                 wx0, wy0, wx1, wy1, text, image_boxes, len(sorted_line) == 1
@@ -2185,7 +2344,7 @@ def check_conservation(
         hlines = _wide_h(page, drawings)
         vlines = _vlines(page, drawings)
         bodies = _table_bodies(page, words=words, hlines=hlines)
-        page_scan[pno] = {"words": words, "bodies": bodies}
+        page_scan[pno] = {"words": words, "bodies": bodies, "tiny": _tiny_scan(page, words, hlines)}
         d = page.get_text("dict")
         blocks = d.get("blocks", []) if isinstance(d, dict) else []
         for b in blocks:
@@ -2270,11 +2429,7 @@ def check_conservation(
             xc, yc = (wx0 + wx1) / 2.0, (wy0 + wy1) / 2.0
             hosts = []
             for rec in recs:
-                bbox = rec.get("bbox") or [0, 0, 0, 0]
-                if len(bbox) != 4:
-                    continue
-                bx0, by0, bx1, by1 = (float(v) for v in bbox)
-                if by0 - 0.4 <= yc < by1 + 0.4 and bx0 - 1.0 <= xc <= bx1 + 1.0:
+                if _in_rec_area(rec, xc, yc):
                     hosts.append(rec)
             if not hosts:
                 continue
@@ -2321,7 +2476,7 @@ def check_conservation(
             for w in words:
                 wx0, wy0, wx1, wy1, text = w
                 xc, yc = (wx0 + wx1) / 2.0, (wy0 + wy1) / 2.0
-                if not (by0 - 0.4 <= yc < by1 + 0.4 and bx0 - 1.0 <= xc <= bx1 + 1.0):
+                if not _in_rec_area(rec, xc, yc):
                     continue
                 if not any(_word_in_text(text, f, allow_digit=False) for f in fields):
                     continue
