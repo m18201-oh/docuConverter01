@@ -42,7 +42,10 @@ from .spec import (
     VLINE_MIN_LEN_PT,
     accept_tiny_titles,
     boundary_splits_cell,
+    bracket_caption_boxes,
+    captioned_figure_regions,
     code_tail_below,
+    figure_attached_flags,
     figure_regions,
     hangul_span_space_ratio,
     in_figure_area,
@@ -1859,6 +1862,33 @@ def _drop_figure_area_spans(band: list[Span], regions_of, cap: float | None) -> 
     return [s for s in band if not in_figure_area(s.xc, s.yc, cap, regions)]
 
 
+def _drop_figure_legend_spans(band: list[Span], regions_of) -> list[Span]:
+    """FA1: 꺾쇠 캡션(<…상세도>·<… 규격>)이 안에 찍힌 도면 영역의 글자와, 그 아래 이어진 범례 줄을 band 에서 뺀다.
+
+    제목 줄([표준도]·[그림)이 없는 그림도 다룬다. regions_of() 는 쪽 도면 영역 목록.
+    """
+    if not band:
+        return band
+    ordered = sorted(band, key=lambda s: (s.y0, s.x0))
+    lines: list[list[Span]] = []
+    for s in ordered:
+        if lines:
+            prev_yc = sum(x.yc for x in lines[-1]) / len(lines[-1])
+            if abs(s.yc - prev_yc) <= max(6.0, (s.y1 - s.y0) * 0.45):
+                lines[-1].append(s)
+                continue
+        lines.append([s])
+    caps = bracket_caption_boxes([[((s.x0, s.y0, s.x1, s.y1), s.text) for s in ln] for ln in lines])
+    if not caps:
+        return band
+    regions = regions_of()
+    marked = captioned_figure_regions(regions, caps) if regions else []
+    if not marked:
+        return band
+    flags = figure_attached_flags([(s.x0, s.y0, s.x1, s.y1) for s in band], marked)
+    return [s for s, f in zip(band, flags) if not f]
+
+
 def _row_boundary_splits_cell(
     hlines: list[LineSeg],
     yc_a: float,
@@ -2404,6 +2434,8 @@ def extract_pdf(
                 # 도면 라벨이다 — 5pt 이상이라 축소 글자 거름에 안 걸린 것(「초잡석」「1h」「버림콘크」)을
                 # 주석 줄 모으기에서 뺀다. 낱말 목록이 아니라 쪽 도면 영역 기하로 판정한다.
                 band = _drop_figure_area_spans(band, _page_figure_regions, band_cap)
+                # FA1: 제목 줄 없이 꺾쇠 캡션만 있는 그림의 범례·캡션 줄도 뺀다.
+                band = _drop_figure_legend_spans(band, _page_figure_regions)
                 raw_lines_y = _cluster_lines_y(band, gap=6.0)
                 line_eols = _eol_spaces_for_lines(
                     chars, [yc for yc, _ in raw_lines_y], hx0, hx1

@@ -21,6 +21,9 @@ from .spec import (
     CODE_WRAP_HEAD_RE,
     accept_tiny_titles,
     code_tail_below,
+    bracket_caption_boxes,
+    captioned_figure_regions,
+    figure_attached_flags,
     figure_regions,
     in_figure_area,
     FIGURE_CAPTION_PREFIXES,
@@ -1944,6 +1947,20 @@ def _note_word_gate(
                     break
             if band_cap_bottom is not None and fig_regions_page is None:
                 fig_regions_page = figure_regions(page)
+            # FA1: 제목 줄 없이 꺾쇠 캡션(<…상세도>·<… 규격>)만 있는 그림 — 그 영역 안 낱말과
+            # 그 아래 이어진 범례 줄은 도면 글자다(추출 쪽 _drop_figure_legend_spans 와 같은 기하).
+            legend_ids: set[int] = set()
+            _caps = bracket_caption_boxes(
+                [[((w[0], w[1], w[2], w[3]), w[4]) for w in _ln] for _ln in band_lines]
+            )
+            if _caps:
+                if fig_regions_page is None:
+                    fig_regions_page = figure_regions(page)
+                _marked = captioned_figure_regions(fig_regions_page or [], _caps)
+                if _marked:
+                    _flat = [w for _ln in band_lines for w in _ln]
+                    _flags = figure_attached_flags([(w[0], w[1], w[2], w[3]) for w in _flat], _marked)
+                    legend_ids = {id(w) for w, f in zip(_flat, _flags) if f}
             for line in band_lines:
                 sorted_line = sorted(line, key=lambda w: w[0])
                 line_yc = sum((w[1] + w[3]) / 2.0 for w in line) / len(line)
@@ -2022,7 +2039,7 @@ def _note_word_gate(
                         band_cap_bottom is not None
                         and not is_caption_line
                         and in_figure_area(xc, yc2, band_cap_bottom, fig_regions_page or [])
-                    )
+                    ) or (not is_caption_line and id(w) in legend_ids)
                     is_diagram_word = (
                         not is_caption_line
                         and (

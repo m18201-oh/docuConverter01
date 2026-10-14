@@ -307,6 +307,103 @@ def in_figure_area(
     return any(x0 <= xc <= x1 and y0 <= yc <= y1 for x0, y0, x1, y1 in regions)
 
 
+# --- 그림 범례·캡션(FA1) ---
+# 제목 줄([표준도]·[그림)이 없는 그림도 있다 — 꺾쇠 캡션(<천장점검로 상세도>·<XG-21 규격>)이
+# 그림 영역 안에 찍힌 그림이다. 그 영역 안 글자와, 그 글자 줄 바로 아래에 이어진 범례 줄은
+# 주석이 아니라 그림에 딸린 글이다(2024H1 p98 JM900.10800 ⑤ 끝 「<XG-21 규격> - LW : 101.6㎜ …」).
+FIGURE_BRACKET_CAPTION_RE = re.compile(r"<[^<>]{1,30}>")
+FIGURE_LEGEND_GAP_FACTOR = 1.0  # 위 줄과의 세로 틈이 글줄 높이의 이 배수 이하면 이어진 범례 줄
+FIGURE_LEGEND_SIZE_FACTOR = 1.1  # 이어 붙는 줄은 위 줄보다 큰 글자(본문 문장)가 아니어야 한다
+
+
+def bracket_caption_boxes(
+    lines: list[list[tuple[tuple[float, float, float, float], str]]],
+) -> list[tuple[float, float, float, float]]:
+    """글줄 목록([(상자, 글)] 의 목록)에서 꺾쇠 캡션 <…> 하나하나의 상자(x0, y0, x1, y1) 목록."""
+    out: list[tuple[float, float, float, float]] = []
+    for ln in lines:
+        ordered = sorted(ln, key=lambda t: t[0][0])
+        pos: list[tuple[int, int, tuple[float, float, float, float]]] = []
+        joined = ""
+        for box, text in ordered:
+            if joined:
+                joined += " "
+            pos.append((len(joined), len(joined) + len(text), box))
+            joined += text
+        for m in FIGURE_BRACKET_CAPTION_RE.finditer(joined):
+            bs = [b for a, e, b in pos if a < m.end() and e > m.start()]
+            if bs:
+                out.append(
+                    (min(b[0] for b in bs), min(b[1] for b in bs), max(b[2] for b in bs), max(b[3] for b in bs))
+                )
+    return out
+
+
+def captioned_figure_regions(
+    regions: list[tuple[float, float, float, float]],
+    captions: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """꺾쇠 캡션이 안에 있거나 바로 아래(캡션 한 줄 높이 이내)에 붙은 도면 영역.
+
+    아래에 붙은 캡션은 영역 아랫끝을 캡션 아랫끝까지 늘려 돌려준다(캡션 글줄이 영역 안으로 들어오게).
+    """
+    out: list[tuple[float, float, float, float]] = []
+    for x0, y0, x1, y1 in regions:
+        bottom = y1
+        hit = False
+        for cx0, cy0, cx1, cy1 in captions:
+            xc, yc, h = (cx0 + cx1) / 2.0, (cy0 + cy1) / 2.0, cy1 - cy0
+            if not (x0 <= xc <= x1):
+                continue
+            if y0 <= yc <= y1 or (y1 <= cy0 and cy0 - y1 <= FIGURE_LEGEND_GAP_FACTOR * h):
+                hit = True
+                bottom = max(bottom, cy1)
+        if hit:
+            out.append((x0, y0, x1, bottom))
+    return out
+
+
+def figure_attached_flags(
+    boxes: list[tuple[float, float, float, float]],
+    marked: list[tuple[float, float, float, float]],
+) -> list[bool]:
+    """각 글 상자가 그림에 딸린 글인가: 꺾쇠 캡션 그림 영역 안이거나, 그런 글 바로 아래에 이어진 줄.
+
+    이어진 줄 = 위에 그림 글이 있고(세로 틈이 글 높이 이하) 가로로 겹치며, 위 글보다 큰 글자가 아닌 것.
+    """
+    flags = [
+        any(r[0] <= (b[0] + b[2]) / 2.0 <= r[2] and r[1] <= (b[1] + b[3]) / 2.0 <= r[3] for r in marked)
+        for b in boxes
+    ]
+    if not any(flags):
+        return flags
+    order = sorted(range(len(boxes)), key=lambda i: (boxes[i][1], boxes[i][0]))
+    changed = True
+    while changed:
+        changed = False
+        for i in order:
+            if flags[i]:
+                continue
+            b = boxes[i]
+            h = b[3] - b[1]
+            for j in order:
+                if not flags[j] or j == i:
+                    continue
+                f = boxes[j]
+                fh = f[3] - f[1]
+                if (
+                    (f[1] + f[3]) / 2.0 < (b[1] + b[3]) / 2.0
+                    and b[1] - f[3] <= FIGURE_LEGEND_GAP_FACTOR * h
+                    and b[1] >= f[1]
+                    and min(b[2], f[2]) - max(b[0], f[0]) > 0
+                    and h <= fh * FIGURE_LEGEND_SIZE_FACTOR
+                ):
+                    flags[i] = True
+                    changed = True
+                    break
+    return flags
+
+
 # --- 축소 ■ 제목(F2-e) ---
 # 원문 조판 결함: 어떤 그룹의 제목·【단가정의】 ①②가 도면 위 1~4pt 축소 글자로만 찍혀
 # 있다(2016H1 p49 AE14*). 축소 ■ 제목은 그 아래 첫 본문 코드가 제목의 코드 접두와
