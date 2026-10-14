@@ -447,10 +447,12 @@ def _build_md_contents(
             g = gmap.get(gid) or {}
             header = g.get("header") or ""
             gmajor = g.get("major") or major
+            # F1: 띠에 인쇄된 대분류 글자 부분(Q, R)이 있으면 제목 줄에 그대로 쓴다. 파일 이름은 major 그대로.
+            gmajor_shown = g.get("major_raw") or gmajor
             gname = g.get("major_name") or major_name
             printed = g.get("printed_page")
             extra = f" (인쇄 {printed}쪽)" if printed else ""
-            lines.append(f"## ■ {_esc_text(header)}   (대분류 {_esc_text(gmajor)} {_esc_text(gname)}){extra}")  # 코치 핫픽스 09-17: 제목 줄도 F6 기준
+            lines.append(f"## ■ {_esc_text(header)}   (대분류 {_esc_text(gmajor_shown)} {_esc_text(gname)}){extra}")  # 코치 핫픽스 09-17: 제목 줄도 F6 기준
             lines.append("")
             group_recs = buckets[gid]
             # N4: 이 그룹에 비고가 있는 레코드가 하나라도 있으면 비고 열을 더한다.

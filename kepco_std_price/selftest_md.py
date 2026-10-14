@@ -1128,6 +1128,64 @@ def run_all() -> Check:
         not region_is_junk([10, 10, 80, 30], [{"kind": "text", "box": [10, 10, 80, 30], "text": "[표준도]"}]),
     )
 
+    # ---------- F1: 대분류 인쇄 표기 major_raw ----------
+    from .extract import _parse_banner_line
+    from .spec import banner_major_raw
+
+    c.check(
+        "F1 띠 단일 -> (A, 이름, 'A')",
+        _parse_banner_line("대분류 A 공통공사") == ("A", "공통공사", "A"),
+        repr(_parse_banner_line("대분류 A 공통공사")),
+    )
+    c.check(
+        "F1 띠 합친 -> (Q, 이름, 'Q, R')",
+        _parse_banner_line("대분류 Q, R 기타공사") == ("Q", "기타공사", "Q, R"),
+        repr(_parse_banner_line("대분류 Q, R 기타공사")),
+    )
+    c.check(
+        "F1 띠 글자 셋 · 공백 여럿은 하나로",
+        banner_major_raw("대분류   Q ,  R,S  기타공사") == "Q , R,S" and banner_major_raw("대분류 Q") == "Q",
+        banner_major_raw("대분류   Q ,  R,S  기타공사"),
+    )
+    c.check("F1 띠가 아니면 빈 문자열", banner_major_raw("일반사항") == "")
+
+    def _g_raw(gid, major, major_raw, name, header):
+        g = _group(gid, "토목", major, name, header)
+        if major_raw is not None:
+            g["major_raw"] = major_raw
+        return g
+
+    res_raw = {
+        "records": [
+            _rec("q1", "QD201.10000", "기타1", "-", "식", "1,000", "10%"),
+            _rec("a1", "AA101.10000", "일반1", "-", "식", "1,000", "10%"),
+            _rec("o1", "BA101.10000", "옛판", "-", "식", "1,000", "10%"),
+        ],
+        "groups": [
+            _g_raw("q1", "Q", "Q, R", "기타공사", "기타 그룹"),
+            _g_raw("a1", "A", "A", "공통공사", "일반 그룹"),
+            _g_raw("o1", "B", None, "옛대분류", "major_raw 없는 옛 결과"),
+        ],
+        "half": "2026H1",
+        "sha256": "deadbeef",
+        "pages": [{"pdf_page": 1, "layout": "L1"}],
+    }
+    with tempfile.TemporaryDirectory(prefix="f1_raw_") as tmp:
+        md_dir = Path(tmp) / "md"
+        render_md(res_raw, md_dir, PDF_NAME)
+        names = sorted(str(p.relative_to(md_dir).as_posix()) for p in md_dir.rglob("*.md"))
+        c.check(
+            "F1 md 파일 이름은 major 그대로",
+            names == ["토목/A_공통공사.md", "토목/B_옛대분류.md", "토목/Q_기타공사.md"],
+            str(names),
+        )
+        q_txt = (md_dir / "토목" / "Q_기타공사.md").read_text(encoding="utf-8")
+        a_txt = (md_dir / "토목" / "A_공통공사.md").read_text(encoding="utf-8")
+        b_txt = (md_dir / "토목" / "B_옛대분류.md").read_text(encoding="utf-8")
+        c.check("F1 합친 띠 제목 줄 (대분류 Q, R 기타공사)", "(대분류 Q, R 기타공사)" in q_txt, q_txt[:300])
+        c.check("F1 단일 띠 제목 줄 (대분류 A 공통공사)", "(대분류 A 공통공사)" in a_txt, a_txt[:300])
+        c.check("F1 major_raw 없으면 major 로", "(대분류 B 옛대분류)" in b_txt, b_txt[:300])
+
     return c
 
 

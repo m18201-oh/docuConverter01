@@ -11,7 +11,7 @@ from pathlib import Path
 
 from lxml import etree
 
-from .extract import ValidationError
+from .extract import ValidationError, _join_cell_lines
 from .table_seq import TableSeq
 from .spec import (
     BANNER_RE,
@@ -34,6 +34,7 @@ from .spec import (
     PUA_SUPER_MAP as _PUA_SUPER_MAP,
     STAR_FIND,
     UNIT_NORM,
+    banner_major_raw,
 )
 
 _STOP = ("TableControl", "GShapeObjectControl")
@@ -117,6 +118,51 @@ def _cell_text(cell: etree._Element) -> str:
     if not lines:
         return _texts_under(cell)
     return "\n".join(lines)
+
+
+def _paragraph_text_lb(p: etree._Element) -> str:
+    """문단 글. 문단 안 강제 줄바꿈(LineBreak)은 앞뒤에 글이 있을 때만 줄바꿈 문자로 남긴다.
+
+    PDF 경로가 칸 안 줄을 줄바꿈 문자로 두는 것과 같은 모양(견인식, 줄바꿈, 3ton 5ton)을 `*_raw` 에 주기 위한 것이다.
+    줄바꿈이 글머리·글끝(앞이나 뒤가 빈칸뿐)이면 버린다.
+    """
+    out = ""
+    pending = False
+
+    def add(t: str) -> None:
+        nonlocal out, pending
+        if pending and t.strip() and out.strip():
+            out += "\n"
+            pending = False
+        elif pending and t.strip():
+            pending = False
+        out += t
+
+    def walk(n: etree._Element) -> None:
+        nonlocal pending
+        if n.tag == "Text" and n.text:
+            add(_fix_pua(n.text))
+        elif n.tag == "LineBreak":
+            pending = True
+        elif n.tag == "EqEdit":
+            script = n.get("script")
+            if script:
+                add(_eq_text(script))
+        for ch in n:
+            if ch.tag in _STOP:
+                continue
+            walk(ch)
+
+    walk(p)
+    return out
+
+
+def _cell_text_lb(cell: etree._Element) -> str:
+    """`_cell_text` 와 같되 문단 안 강제 줄바꿈도 줄바꿈 문자로 남긴다(레코드의 `*_raw` 전용)."""
+    paras = cell.findall("Paragraph")
+    if not paras:
+        return _texts_under(cell)
+    return "\n".join(_paragraph_text_lb(p) for p in paras)
 
 
 def _cell_text_nodes(cell: etree._Element) -> list[str]:
@@ -215,6 +261,7 @@ def _table_rows(tbl: etree._Element) -> list[list[dict]]:
                     "colspan": int(c.get("colspan") or 1),
                     "rowspan": int(c.get("rowspan") or 1),
                     "text": _cell_text(c),
+                    "text_lb": _cell_text_lb(c),
                     "texts": _cell_text_nodes(c),
                     "el": c,
                 }
@@ -225,14 +272,6 @@ def _table_rows(tbl: etree._Element) -> list[list[dict]]:
 
 def _collapse(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
-
-
-def _join_cell_lines(raw: str) -> str:
-    lines = raw.split("\n")
-    out = lines[0] if lines else ""
-    for ln in lines[1:]:
-        out += ("" if out.endswith("/") else " ") + ln
-    return re.sub(r"\s+", " ", out).strip()
 
 
 def _is_inherit(s: str) -> bool:
@@ -290,7 +329,7 @@ def _is_banner_row(cells: list[dict]) -> bool:
     return a.startswith("대분류")
 
 
-def _parse_banner(cells: list[dict]) -> tuple[str, str] | None:
+def _parse_banner(cells: list[dict]) -> tuple[str, str, str] | None:
     if not _is_banner_row(cells):
         return None
     left = _collapse(cells[0]["text"])
@@ -305,7 +344,7 @@ def _parse_banner(cells: list[dict]) -> tuple[str, str] | None:
             name = re.sub(r"\d+$", "", name)
             if len(name) > MAJOR_NAME_MAX_LEN:
                 name = name[:MAJOR_NAME_MAX_LEN]
-            return letter, name
+            return letter, name, banner_major_raw(cand) or letter
     return None
 
 
@@ -587,6 +626,7 @@ def extract_from_root(
 
     last_group: dict | None = None
     last_major = ""
+    last_major_raw = ""
     last_major_name = ""
     last_field = ""
     last_sub: tuple[str, str] | None = None
@@ -635,6 +675,7 @@ def extract_from_root(
             "header_raw": raw,
             "header": header,
             "major": last_major,
+            "major_raw": last_major_raw,
             "major_name": last_major_name,
             "field": last_field,
             "notes": [],
@@ -720,7 +761,8 @@ def extract_from_root(
                 fname = colmap.get(c["col"])
                 if not fname:
                     continue
-                fields[fname] = c["text"]
+                # 이름·규격·단위·비고 칸은 문단 안 줄바꿈을 줄바꿈 문자로 남긴 글(PDF 경로의 칸 안 줄과 같은 모양)
+                fields[fname] = c["text_lb"] if fname in ("name", "spec", "unit", "remark") else c["text"]
 
             code_raw = fields.get("code") or ""
             m = CODE_FIND.search(code_raw)
@@ -836,6 +878,8 @@ def extract_from_root(
             if grp is not None:
                 if not grp.get("major"):
                     grp["major"] = code[0]
+                if not grp.get("major_raw"):
+                    grp["major_raw"] = grp["major"]
                 grp["record_count"] = grp.get("record_count", 0) + 1
             records.append(rec)
 
@@ -843,7 +887,7 @@ def extract_from_root(
         last_prev_name = prev_name
 
     def handle_one_table(tbl: etree._Element, section_id: int, para_index: int) -> None:
-        nonlocal table_index, in_notes, last_major, last_major_name, pending_title, current_title
+        nonlocal table_index, in_notes, last_major, last_major_raw, last_major_name, pending_title, current_title
         table_index += 1
         rows = _table_rows(tbl)
         if not rows:
@@ -855,7 +899,7 @@ def extract_from_root(
         banner = _parse_banner(rows[0]) if len(rows) == 1 else None
         if banner:
             flush_notes()
-            last_major, last_major_name = banner
+            last_major, last_major_name, last_major_raw = banner
             return
         if in_notes or (last_group is not None and not _is_diagram_table(rows)):
             if _is_diagram_table(rows):
@@ -928,6 +972,7 @@ def extract_from_root(
                     flush_notes()
                     last_group = None
                     last_major = ""
+                    last_major_raw = ""
                     last_major_name = ""
                     pending_title = None
                     current_title = None

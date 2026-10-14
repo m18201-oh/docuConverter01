@@ -5,7 +5,7 @@
 
     HwpDoc > BodyText > SectionDef(section-id) > PageDef(width, height)
                                                > ColumnSet > Paragraph > Text
-    Paragraph 안: Text · TableControl · GShapeObjectControl · Control > EqEdit(script) · Footer …
+    Paragraph 안: Text · LineBreak(표 칸 안 문단 줄바꿈) · TableControl · GShapeObjectControl · Control > EqEdit(script) · Footer …
     TableControl > [TableCaption > Paragraph] · TableBody > TableRow > TableCell(col,row,colspan,rowspan) > Paragraph
 
 읽는 곳:
@@ -200,14 +200,17 @@ def _line_starts(payload: bytes | None) -> list[int]:
     return [struct.unpack_from("<I", payload, k * 36)[0] for k in range(len(payload) // 36)]
 
 
+_LINE_BREAK = object()  # 문단 안 강제 줄바꿈(글자 코드 10) 자리 표지
+
+
 def _text_nodes(
     toks: list[tuple[str, int, int]],
     shapes: list[tuple[int, int]],
     line_starts: list[int],
     props: list[int],
     in_cell: bool,
-) -> list[str | None]:
-    """글자 토큰 → 순서대로 글 조각(글) 또는 확장 컨트롤 자리(None).
+) -> list[object]:
+    """글자 토큰 → 순서대로 글 조각(글) · 확장 컨트롤 자리(None) · 칸 안 문단 줄바꿈 자리(_LINE_BREAK).
 
     글 조각은 컨트롤이 나오는 자리·글자 모양이 바뀌는 자리·줄이 시작하는 자리·글자 갈래가 바뀌는 자리에서 끊는다.
     갈래는 컨트롤·글자 모양·줄로 끊긴 구간마다 정한다: 숫자·빈칸·구두점은 앞의 강한 글자를 따르고,
@@ -257,7 +260,7 @@ def _text_nodes(
     assign()
 
     # 2) 끊어서 글 조각을 만든다.
-    out: list[str | None] = []
+    out: list[object] = []
     buf: list[int] = []
     buf_shape = -1
     buf_lang = ""
@@ -282,6 +285,8 @@ def _text_nodes(
             flush()
             if kind == "ext":
                 out.append(None)
+            elif kind == "ctl" and v == 10 and in_cell:
+                out.append(_LINE_BREAK)
             continue
         sid = shape_of[p]
         lg = lang_of[p]
@@ -382,6 +387,9 @@ def _build_paragraph(
         )
     ci = 0
     for item in nodes:
+        if item is _LINE_BREAK:
+            etree.SubElement(para, "LineBreak")
+            continue
         if item is not None:
             t = etree.SubElement(para, "Text")
             t.text = str(item)
