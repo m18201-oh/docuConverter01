@@ -741,8 +741,13 @@ def run_all() -> Check:
         _hwp_join_cell_lines("쉬트파일박기/진동식/\n(N≦15)") == "쉬트파일박기/진동식/(N≦15)",
     )
     c.check(
-        "K1 S2 / 뒤 빈칸은 유지",
-        _hwp_join_cell_lines("쉬트파일박기/진동식/ \n(N≦15)") == "쉬트파일박기/진동식/ (N≦15)",
+        "K1 S2 / 뒤 빈칸도 떼고 잇는다 (F3-b)",
+        _hwp_join_cell_lines("쉬트파일박기/진동식/ \n(N≦15)") == "쉬트파일박기/진동식/(N≦15)",
+    )
+    c.check(
+        "K1 S2b 아랫줄이 /로 시작하면 빈칸 없이 (F3-b)",
+        _hwp_join_cell_lines("리핑암\n/굴착깊이") == "리핑암/굴착깊이"
+        and _hwp_join_cell_lines("리핑암 \n /굴착깊이") == "리핑암/굴착깊이",
     )
     c.check("K1 S3 일반 줄바꿈은 빈칸", _hwp_join_cell_lines("콘크리트\n타설") == "콘크리트 타설")
     c.check("K1 S4 연속 / 줄바꿈", _hwp_join_cell_lines("가/\n나/\n다") == "가/나/다")

@@ -854,11 +854,14 @@ def _compact(s: str) -> str:
 
 
 def _join_cell_lines(s: str | None) -> str:
-    """원문 칸 줄을 잇는다. 윗줄이 「/」로 끝나면 빈칸 없이, 아니면 빈칸 하나로. 연속 공백은 하나로, 앞뒤는 뗀다."""
+    """원문 칸 줄을 잇는다. 줄 경계에서 윗줄이 「/」로 끝나거나(끝 공백은 뗀다) 아랫줄이 「/」로 시작하면(앞 공백은 뗀다) 빈칸 없이, 아니면 빈칸 하나로. 연속 공백은 하나로, 앞뒤는 뗀다."""
     lines = (s or "").split("\n")
     out = lines[0]
     for ln in lines[1:]:
-        out += ("" if out.endswith("/") else " ") + ln
+        if out.rstrip().endswith("/") or ln.lstrip().startswith("/"):
+            out = out.rstrip() + ln.lstrip()
+        else:
+            out += " " + ln
     return re.sub(r"\s+", " ", out).strip()
 
 

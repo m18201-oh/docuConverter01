@@ -827,12 +827,15 @@ def _reparse_unit_norm(unit: str | None) -> str | None:
 
 def _join_cell_lines(s: str | None) -> str:
     """extract.py 의 _join_cell_lines() 와 같은 규칙을 독립적으로 다시 구현한다(추출 코드의 함수를
-    그대로 불러 쓰지 않는다): 줄 사이를 이을 때 윗줄이 「/」로 끝나면 빈칸 없이, 아니면 빈칸 하나로.
+    그대로 불러 쓰지 않는다): 줄 경계에서 윗줄이 「/」로 끝나거나(끝 공백은 뗀다) 아랫줄이 「/」로 시작하면(앞 공백은 뗀다) 빈칸 없이, 아니면 빈칸 하나로.
     연속 공백은 한 칸으로, 앞뒤는 뗀다."""
     lines = (s or "").split("\n")
     out = lines[0]
     for ln in lines[1:]:
-        out += ("" if out.endswith("/") else " ") + ln
+        if out.rstrip().endswith("/") or ln.lstrip().startswith("/"):
+            out = out.rstrip() + ln.lstrip()
+        else:
+            out += " " + ln
     return re.sub(r"\s+", " ", out).strip()
 
 
