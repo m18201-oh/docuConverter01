@@ -1186,6 +1186,312 @@ def run_all() -> Check:
         c.check("F1 단일 띠 제목 줄 (대분류 A 공통공사)", "(대분류 A 공통공사)" in a_txt, a_txt[:300])
         c.check("F1 major_raw 없으면 major 로", "(대분류 B 옛대분류)" in b_txt, b_txt[:300])
 
+
+    # ---------- F2: 옛 판 주석 끝 도면 글자 · 행 상자 · 꺾인 코드 · 병합 명칭 칸 · 축소 ■ 제목 ----------
+    from .extract import (
+        Span,
+        _caption_bottom,
+        _codes_and_stars,
+        _drop_figure_area_spans,
+        _row_boundary_splits_cell,
+    )
+    from .spec import (
+        accept_tiny_titles,
+        boundary_splits_cell,
+        code_tail_below,
+        in_figure_area,
+    )
+
+    # 순수 기하 도우미
+    c.check(
+        "F2 꺾인 코드 꼬리: 바로 아래 같은 칸 낱글자",
+        code_tail_below((61.6, 485.5, 125.5, 499.8), (90.7, 501.1, 96.6, 515.4)) is True,
+    )
+    c.check(
+        "F2 꺾인 코드 꼬리: 다음 행(2줄 아래) 글자는 아님",
+        code_tail_below((61.6, 485.5, 125.5, 499.8), (90.7, 531.0, 96.6, 545.4)) is False,
+    )
+    c.check(
+        "F2 꺾인 코드 꼬리: 칸 밖 오른쪽 글자는 아님",
+        code_tail_below((61.6, 485.5, 125.5, 499.8), (330.0, 501.1, 336.0, 515.4)) is False,
+    )
+    sp_code = [
+        Span(64.4, 485.5, 125.5, 499.8, "ND109.1112", 12.0),
+        Span(90.7, 501.1, 96.6, 515.4, "1", 12.0),
+        Span(64.4, 517.2, 125.5, 531.6, "ND109.1112", 12.0),
+        Span(90.7, 529.2, 96.6, 543.6, "2", 12.0),
+    ]
+    codes_f2, _stars_f2 = _codes_and_stars(sp_code, 0.0, 595.0)
+    c.check(
+        "F2 두 줄로 꺾인 공종코드를 이어 코드로 인식(위 행·아래 행)",
+        sorted(x.text for x in codes_f2) == ["ND109.11121", "ND109.11122"],
+        str([x.text for x in codes_f2]),
+    )
+    c.check(
+        "F2 꼬리가 없는 앞 열 자리는 코드가 아님",
+        _codes_and_stars([Span(64.4, 485.5, 125.5, 499.8, "ND109.1112", 12.0)], 0.0, 595.0)[0] == [],
+    )
+    hl_merged = [LineSeg(59.4, 131.0, 148.0), LineSeg(244.3, 536.1, 148.0)]
+    c.check(
+        "F2 병합 칸: 경계선이 명칭 칸에서만 끊김",
+        _row_boundary_splits_cell(hl_merged, 130.0, 160.0, (131.0, 244.3), (59.4, 536.1)) is True,
+    )
+    c.check(
+        "F2 병합 칸 아님: 경계선이 전체 폭",
+        _row_boundary_splits_cell([LineSeg(59.4, 536.1, 148.0)], 130.0, 160.0, (131.0, 244.3), (59.4, 536.1)) is False,
+    )
+    c.check(
+        "F2 병합 칸 아님: 경계선이 아예 없음",
+        _row_boundary_splits_cell([], 130.0, 160.0, (131.0, 244.3), (59.4, 536.1)) is False,
+    )
+    c.check(
+        "F2 boundary_splits_cell 직접",
+        boundary_splits_cell([(59.4, 131.0), (244.3, 536.1)], (131.0, 244.3), (59.4, 536.1)) is True,
+    )
+    c.check(
+        "F2 그림 영역: 제목 줄 아래 영역 안만 True",
+        in_figure_area(321.0, 723.0, 612.0, [(1.7, 569.3, 584.6, 795.8)]) is True
+        and in_figure_area(321.0, 580.0, 612.0, [(1.7, 569.3, 584.6, 795.8)]) is False
+        and in_figure_area(321.0, 723.0, None, [(1.7, 569.3, 584.6, 795.8)]) is False
+        and in_figure_area(700.0, 723.0, 612.0, [(1.7, 569.3, 584.6, 795.8)]) is False,
+    )
+    band_f2 = [
+        Span(68.6, 576.3, 80.6, 590.7, "③", 12.0),
+        Span(86.6, 576.3, 200.0, 590.7, "맨홀발 디딤쇄 설치비는 포함한다.", 12.0),
+        Span(86.6, 597.9, 126.5, 612.3, "[표준도]", 12.0),
+        Span(148.6, 597.9, 247.7, 612.3, "우수맨홀(900×900)", 12.0),
+        Span(316.0, 721.0, 337.6, 729.0, "초잡석", 12.0),
+    ]
+    c.check("F2 그림 제목 줄 아랫끝", abs((_caption_bottom(band_f2) or 0) - 612.3) < 0.01, str(_caption_bottom(band_f2)))
+    kept_f2 = _drop_figure_area_spans(band_f2, lambda: [(1.7, 569.3, 584.6, 795.8)], _caption_bottom(band_f2))
+    c.check(
+        "F2 도면 영역 글자만 빠지고 ③ 문장·제목 줄은 남는다",
+        [x.text for x in kept_f2] == ["③", "맨홀발 디딤쇄 설치비는 포함한다.", "[표준도]", "우수맨홀(900×900)"],
+        str([x.text for x in kept_f2]),
+    )
+    c.check(
+        "F2 그림 제목 줄이 없으면 아무것도 안 뺀다",
+        _drop_figure_area_spans(band_f2[:2], lambda: [(1.7, 569.3, 584.6, 795.8)], None) == band_f2[:2],
+    )
+    c.check(
+        "F2 축소 ■ 제목: 아래 첫 코드 접두와 같으면 받아들임, AA21* 같은 다른 제목은 안 받음",
+        accept_tiny_titles(
+            [(137.0, "■AA21*엄지말뚝-변전소"), (165.0, "■AE14*쉬트파일-전력구")],
+            [],
+            [(518.0, "AE141.11100"), (548.0, "AE141.12100")],
+        )
+        == [165.0],
+    )
+    c.check(
+        "F2 축소 ■ 제목: 아래 본문 코드가 없으면(도면 안 사본) 안 받음",
+        accept_tiny_titles([(312.0, "■AE16*축버팀대(Strut)")], [], []) == [],
+    )
+    c.check(
+        "F2 축소 ■ 제목: 사이에 실제 ■ 제목이 있으면 안 받음",
+        accept_tiny_titles([(165.0, "■AE14*쉬트파일")], [300.0], [(518.0, "AE141.11100")]) == [],
+    )
+    from .figures import table_margin_debris
+
+    tb_f2 = [[55.4, 619.0, 544.8, 720.7]]
+    cr_f2 = [0, 0, 595.0, 842.0]
+    c.check(
+        "F2 그림 영역 정리: 표 옆 왼쪽 여백의 작은 도면 조각은 그림이 아니다",
+        table_margin_debris([4.1, 654.1, 9.7, 659.4], tb_f2, cr_f2) is True
+        and table_margin_debris([560.0, 654.1, 570.0, 659.4], tb_f2, cr_f2) is True,
+    )
+    c.check(
+        "F2 그림 영역 정리: 표 안·표와 다른 높이·큰 도면은 여백 조각이 아니다",
+        table_margin_debris([100.0, 654.1, 105.0, 659.4], tb_f2, cr_f2) is False
+        and table_margin_debris([4.1, 400.0, 9.7, 405.0], tb_f2, cr_f2) is False
+        and table_margin_debris([4.1, 654.1, 140.0, 700.0], tb_f2, cr_f2) is False,
+    )
+
+    # 합성 PDF 끝에서 끝까지(추출 + 보존 검사)
+    import pymupdf as _fz2
+
+    def _f2_make_pdf(path: Path) -> None:
+        doc = _fz2.open()
+
+        def txt(page, x, y, s_, size=12.0):
+            page.insert_text((x, y), s_, fontname="korea", fontsize=size)
+
+        def table(page, y_top, rows, merged_first_boundary=None, x_left_junk=False):
+            xs = [40, 200, 310, 380, 420, 470, 555]
+            y_hdr = y_top + 30
+            y_end = y_hdr + 40 * len(rows)
+            page.draw_line((40, y_top), (555, y_top))
+            page.draw_line((40, y_hdr), (555, y_hdr))
+            for x in xs:
+                page.draw_line((x, y_top), (x, y_end))
+            for i in range(len(rows)):
+                yb = y_hdr + 40 * (i + 1)
+                if merged_first_boundary == i:
+                    page.draw_line((40, yb), (200, yb))
+                    page.draw_line((310, yb), (555, yb))
+                else:
+                    page.draw_line((40, yb), (555, yb))
+            if x_left_junk:
+                # 쪽 왼쪽 밖까지 뻗은 도면 가로선(표 격자 선이 아님)
+                page.draw_line((-30, y_hdr + 1.5), (300, y_hdr + 1.5))
+            for lab, x in (
+                ("공종코드", 90), ("공종명칭", 230), ("규격", 332), ("단위", 388), ("단가", 432), ("노무비율", 490),
+            ):
+                txt(page, x, y_top + 20, lab)
+            for i, (head, tail, name, spec, price, labor) in enumerate(rows):
+                base = y_hdr + 40 * i + 22
+                txt(page, 45, base, head)
+                if tail:
+                    txt(page, 100, base + 16, tail)
+                if name:
+                    txt(page, 210, base, name)
+                txt(page, 318, base, spec)
+                txt(page, 392, base, "m")
+                txt(page, 424, base, price)
+                txt(page, 514, base, labor)
+            return y_end
+
+        # 쪽 1: 꺾인 코드 · 병합 명칭 칸 · 그림 제목 아래 도면 라벨
+        p1 = doc.new_page(width=595, height=842)
+        txt(p1, 60, 90, "■ AB10* 시험 그룹 - 공통")
+        end = table(
+            p1, 110,
+            [
+                ("AB101.1000", "1", "시험명칭/", "규격A", "1,234", "55%"),
+                ("AB101.20001", "", "", "규격B", "2,345", "50%"),
+                ("AB101.30001", "", "〃", "규격C", "3,456", "45%"),
+            ],
+            merged_first_boundary=0,
+        )
+        txt(p1, 210, 140 + 40 + 22, "병합줄")
+        txt(p1, 60, end + 30, "【단가정의】")
+        txt(p1, 70, end + 50, "① 첫째 항목입니다.")
+        cap_y = end + 80
+        txt(p1, 70, cap_y, "[표준도] 도면제목")
+        p1.draw_rect(_fz2.Rect(40, cap_y + 15, 555, cap_y + 115))
+        txt(p1, 200, cap_y + 60, "도면라벨")
+        # 쪽 2: 앞 쪽에서 이어지는 주석 + 다음 쪽 그림 제목·도면 라벨 + 왼쪽 밖 도면 선이 섞인 표
+        p2 = doc.new_page(width=595, height=842)
+        txt(p2, 70, 70, "② 이어지는 항목입니다.")
+        txt(p2, 70, 100, "[표준도] 다음도면")
+        p2.draw_rect(_fz2.Rect(40, 115, 555, 215))
+        txt(p2, 200, 165, "다음쪽라벨")
+        txt(p2, 60, 250, "■ AB20* 둘째 그룹 - 공통")
+        table(p2, 270, [("AB201.10000", "", "둘째명칭", "규격D", "4,567", "40%")], x_left_junk=True)
+        # 쪽 3: 축소 글자로만 찍힌 ■ 제목(아래 첫 코드 접두 AB30 과 같음)
+        p3 = doc.new_page(width=595, height=842)
+        txt(p3, 150, 100, "■ AB30* 축소제목 - 공통", size=1.8)
+        txt(p3, 150, 115, "【단가정의】", size=1.8)
+        txt(p3, 150, 120, "① 축소 항목입니다.", size=1.8)
+        end3 = table(p3, 300, [("AB301.10000", "", "셋째명칭", "규격E", "5,678", "35%")])
+        txt(p3, 60, end3 + 30, "【단가정의】")
+        txt(p3, 70, end3 + 50, "③ 실제 항목입니다.")
+        # 쪽 4: 도면 안 축소 ■ 사본(아래 본문 코드 없음 -> 그룹 아님)
+        p4 = doc.new_page(width=595, height=842)
+        txt(p4, 60, 90, "■ AB40* 넷째 그룹 - 공통")
+        end4 = table(p4, 110, [("AB401.10000", "", "넷째명칭", "규격F", "6,789", "30%")])
+        txt(p4, 60, end4 + 30, "【단가정의】")
+        txt(p4, 70, end4 + 50, "① 넷째 항목입니다.")
+        p4.draw_rect(_fz2.Rect(40, 450, 555, 600))
+        txt(p4, 150, 500, "■ AB99* 사본제목 - 공통", size=1.8)
+        txt(p4, 150, 510, "① 사본 항목입니다.", size=1.8)
+        # 쪽 5: 사건 없이 글만 -> 앞 쪽 끝 사본 그룹의 이어짐
+        p5 = doc.new_page(width=595, height=842)
+        txt(p5, 70, 80, "⑤ 사본 이어짐입니다.")
+        doc.save(path)
+        doc.close()
+
+    from .conservation import check_conservation as _check_cons_f2
+
+    with tempfile.TemporaryDirectory(prefix="f2_synth_") as tmp:
+        f2_pdf = Path(tmp) / "f2.pdf"
+        _f2_make_pdf(f2_pdf)
+        f2 = extract_pdf(f2_pdf, half="2016H1")
+        f2_cache = f2.pop("_table_cache", None)
+        f2_rep = _check_cons_f2(f2_pdf, f2, table_cache=f2_cache)
+        f2_g = {g["header"].split()[0]: g for g in f2["groups"]}
+        f2_r = {r["code"]: r for r in f2["records"]}
+
+        c.check(
+            "F2 그룹은 AB10* AB20* AB30*(축소 제목) AB40* 넷뿐 — 도면 안 사본 AB99* 는 그룹이 아님",
+            [g["header"].split()[0] for g in f2["groups"]] == ["AB10*", "AB20*", "AB30*", "AB40*"],
+            str([g["header"] for g in f2["groups"]]),
+        )
+        c.check(
+            "F2 쪽을 넘는 주석: 그림 라벨(도면라벨·다음쪽라벨)을 끌고 오지 않는다",
+            [n["item_raw"] for n in f2_g["AB10*"]["notes"]] == ["① 첫째 항목입니다.", "② 이어지는 항목입니다."],
+            str([n["item_raw"] for n in f2_g["AB10*"]["notes"]]),
+        )
+        c.check(
+            "F2 두 줄로 꺾인 공종코드 AB101.10001 레코드가 있다",
+            "AB101.10001" in f2_r and f2_r["AB101.10001"]["price_raw"] == "1,234",
+            str(sorted(f2_r)),
+        )
+        r_a, r_b, r_c = f2_r.get("AB101.10001", {}), f2_r.get("AB101.20001", {}), f2_r.get("AB101.30001", {})
+        c.check(
+            "F2 병합 명칭 칸: 첫 행 name_raw 는 칸 전체, name 은 줄을 이은 전체 명칭",
+            r_a.get("name") == "시험명칭/병합줄"
+            and r_a.get("name_raw") == "시험명칭/\n병합줄"
+            and r_a.get("name_inherited") is False,
+            str((r_a.get("name"), r_a.get("name_raw"))),
+        )
+        c.check(
+            "F2 병합 명칭 칸: 둘째 행은 name_raw 빈칸·상속, name 은 첫 행 전체 명칭",
+            r_b.get("name") == "시험명칭/병합줄" and r_b.get("name_raw") == "" and r_b.get("name_inherited") is True,
+            str((r_b.get("name"), r_b.get("name_raw"), r_b.get("name_inherited"))),
+        )
+        c.check(
+            "F2 병합 칸 뒤 〃 행도 전체 명칭을 이어받는다",
+            r_c.get("name") == "시험명칭/병합줄" and r_c.get("name_inherited") is True,
+            str((r_c.get("name"), r_c.get("name_inherited"))),
+        )
+        c.check(
+            "F2 병합 칸 첫 행에만 name_cell_bbox(칸이 걸친 모든 행)",
+            r_a.get("name_cell_bbox") == [200.0, 140.0, 310.0, 220.0]
+            and "name_cell_bbox" not in r_b
+            and "name_cell_bbox" not in r_c,
+            str((r_a.get("name_cell_bbox"), r_b.get("name_cell_bbox"))),
+        )
+        c.check(
+            "F2 쪽 밖으로 뻗은 도면 선이 섞여도 행 상자 x0 는 표 칸 경계(40)",
+            f2_r["AB201.10000"]["bbox"][0] == 40.0,
+            str(f2_r["AB201.10000"]["bbox"]),
+        )
+        c.check(
+            "F2 축소 ■ 제목 그룹: 레코드 하나 + 축소 ① 과 실제 ③ 주석",
+            f2_g["AB30*"]["record_count"] == 1
+            and [n["item_raw"] for n in f2_g["AB30*"]["notes"]] == ["① 축소 항목입니다.", "③ 실제 항목입니다."],
+            str([n["item_raw"] for n in f2_g["AB30*"]["notes"]]),
+        )
+        c.check(
+            "F2 축소 사본 뒤 쪽 맨 위 글(⑤)은 직전 그룹 AB40* 주석이 아니다",
+            [n["item_raw"] for n in f2_g["AB40*"]["notes"]] == ["① 넷째 항목입니다."],
+            str([n["item_raw"] for n in f2_g["AB40*"]["notes"]]),
+        )
+        f2_tot = f2_rep["totals"]
+        c.check(
+            "F2 합성 PDF 보존 검사 pass (낱말 빠짐·중복·주석 순서·코드 누락 0)",
+            f2_tot["pass"] is True
+            and f2_tot["missing"] == 0
+            and f2_tot["notes_missing"] == 0
+            and f2_tot["notes_order_mismatch"] == 0
+            and f2_tot["unrecorded_codes"] == 0,
+            str({k: v for k, v in f2_tot.items() if v not in (0, False)}),
+        )
+        c.check(
+            "F2 도면 라벨은 주석 낱말이 아니라 도면 글자로 분류(notes_figure_text 2건)",
+            f2_tot["notes_figure_text"] == 2,
+            str(f2_tot["notes_figure_text"]),
+        )
+        # 게이트도 꺾인 코드 행이 빠지면 잡는다: 레코드 하나를 지운 결과로 다시 검사
+        f2_broken = dict(f2)
+        f2_broken["records"] = [r for r in f2["records"] if r["code"] != "AB101.10001"]
+        f2_rep_bad = _check_cons_f2(f2_pdf, f2_broken, table_cache=f2_cache)
+        c.check(
+            "F2 꺾인 코드 레코드가 빠지면 보존 검사가 잡는다(unrecorded_codes)",
+            f2_rep_bad["totals"]["unrecorded_codes"] >= 1 and f2_rep_bad["totals"]["pass"] is False,
+            str(f2_rep_bad["totals"]["unrecorded_codes"]),
+        )
+
     return c
 
 
