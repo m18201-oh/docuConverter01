@@ -1,0 +1,5 @@
+# 규칙·시험·CI 는 저장소 소유자 리뷰 필수 (DevTeam, 2026-10-16)
+/.github/            @m18201-oh
+/AGENTS.md           @m18201-oh
+/**/selftest_*.py    @m18201-oh
+/**/conservation*.py @m18201-oh
